@@ -13,7 +13,10 @@ use rustls::{
     StreamOwned,
 };
 
-use crate::subscription::{parse_subscription, ProxyNode};
+use crate::subscription::{
+    inspect_subscription_config, parse_subscription, ProxyNode, SubscriptionConfigHints,
+    SubscriptionContentKind,
+};
 
 #[derive(Clone, Debug)]
 pub struct CheckOptions {
@@ -44,6 +47,21 @@ pub enum CheckEvent {
     Failed(String),
 }
 
+#[derive(Clone, Debug)]
+pub struct SubscriptionPrivacyAssessment {
+    pub level: SecurityLevel,
+    pub reason: String,
+}
+
+impl Default for SubscriptionPrivacyAssessment {
+    fn default() -> Self {
+        Self {
+            level: SecurityLevel::Unknown,
+            reason: "等待下载订阅后评估本机私流安全。".to_owned(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct StartSummary {
     pub total: usize,
@@ -51,6 +69,7 @@ pub struct StartSummary {
     pub duplicate_endpoints: usize,
     pub duplicate_names: usize,
     pub tls_target_count: usize,
+    pub local_privacy: SubscriptionPrivacyAssessment,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +161,14 @@ pub struct SecurityAssessment {
     pub security_level: SecurityLevel,
     pub encryption_level: EncryptionLevel,
     pub score: u8,
+    pub security_reason: String,
+    pub encryption_reason: String,
+    pub gateway_level: SecurityLevel,
+    pub gateway_reason: String,
+    pub anti_tracking_level: SecurityLevel,
+    pub anti_tracking_reason: String,
+    pub live_network_level: SecurityLevel,
+    pub live_network_reason: String,
     pub note: String,
 }
 
@@ -309,8 +336,9 @@ fn run_check(
         .text()
         .map_err(|error| format!("读取订阅内容失败：{error}"))?;
 
+    let config_hints = inspect_subscription_config(&content);
     let nodes = parse_subscription(&content)?;
-    let summary = summarize_subscription(&nodes);
+    let summary = summarize_subscription(&nodes, &config_hints);
     tx.send(CheckEvent::Started(summary))
         .map_err(|error| error.to_string())?;
 
@@ -460,7 +488,10 @@ fn collect_endpoint_probe(node: &ProxyNode, options: &CheckOptions) -> EndpointP
     }
 }
 
-fn summarize_subscription(nodes: &[ProxyNode]) -> StartSummary {
+fn summarize_subscription(
+    nodes: &[ProxyNode],
+    config_hints: &SubscriptionConfigHints,
+) -> StartSummary {
     let mut endpoint_set = HashSet::new();
     let mut name_set = HashSet::new();
     let mut duplicate_names = 0usize;
@@ -478,6 +509,7 @@ fn summarize_subscription(nodes: &[ProxyNode]) -> StartSummary {
 
     let unique_endpoints = endpoint_set.len();
     let duplicate_endpoints = nodes.len().saturating_sub(unique_endpoints);
+    let local_privacy = assess_subscription_local_privacy(config_hints, nodes);
 
     StartSummary {
         total: nodes.len(),
@@ -485,7 +517,251 @@ fn summarize_subscription(nodes: &[ProxyNode]) -> StartSummary {
         duplicate_endpoints,
         duplicate_names,
         tls_target_count,
+        local_privacy,
     }
+}
+
+fn assess_subscription_local_privacy(
+    config_hints: &SubscriptionConfigHints,
+    nodes: &[ProxyNode],
+) -> SubscriptionPrivacyAssessment {
+    if nodes.is_empty() {
+        return SubscriptionPrivacyAssessment {
+            level: SecurityLevel::Unknown,
+            reason: "订阅中没有可评估节点，无法判断本机私流风险。".to_owned(),
+        };
+    }
+
+    let mut notes = Vec::new();
+    let mut score = 100_i32;
+
+    match config_hints.kind {
+        SubscriptionContentKind::ClashYaml => {
+            match config_hints.dns_enabled {
+                Some(true) => {
+                    if config_hints.dns_nameserver_count == 0 {
+                        score -= 20;
+                        push_note(&mut notes, "已启用 DNS 模块，但未见上游 nameserver 配置");
+                    }
+                    if config_hints.dns_fallback_count == 0 {
+                        score -= 5;
+                        push_note(&mut notes, "DNS 未配置 fallback，上游容灾与泄露回退保护较弱");
+                    }
+                    if !config_hints
+                        .dns_enhanced_mode
+                        .as_deref()
+                        .is_some_and(|value| {
+                            matches!(value.to_ascii_lowercase().as_str(), "fake-ip" | "redir-host")
+                        })
+                    {
+                        score -= 10;
+                        push_note(&mut notes, "DNS 未启用 fake-ip/redir-host 增强模式");
+                    }
+                    if config_hints.dns_respect_rules != Some(true) {
+                        score -= 5;
+                        push_note(&mut notes, "DNS 未明确 respect-rules，分流一致性未知");
+                    }
+                    if config_hints.allow_lan == Some(true)
+                        && config_hints
+                            .dns_listen
+                            .as_deref()
+                            .is_some_and(|listener| !is_local_listener(listener))
+                    {
+                        score -= 10;
+                        push_note(&mut notes, "DNS 监听地址对局域网开放，可能扩大本地查询暴露面");
+                    }
+                }
+                Some(false) => {
+                    score -= 30;
+                    push_note(&mut notes, "订阅显式关闭 DNS 模块，本机查询是否经代理无法保证");
+                }
+                None => {
+                    score -= 25;
+                    push_note(&mut notes, "未见完整 DNS 保护配置，存在 DNS 泄露不确定性");
+                }
+            }
+
+            match config_hints.mode.as_deref().map(|value| value.to_ascii_lowercase()) {
+                Some(mode) if mode == "rule" => {
+                    if config_hints.rule_count + config_hints.rule_provider_count == 0 {
+                        score -= 20;
+                        push_note(&mut notes, "mode=rule 但未见 rules/rule-providers，私流分流规则不足");
+                    }
+                }
+                Some(mode) if mode == "direct" => {
+                    score -= 35;
+                    push_note(&mut notes, "mode=direct 会让系统流量默认直连，本机私流泄露风险高");
+                }
+                Some(mode) if mode == "global" => {
+                    push_note(&mut notes, "mode=global 更依赖客户端是否正确接管系统流量");
+                }
+                _ => {
+                    if config_hints.rule_count + config_hints.rule_provider_count == 0 {
+                        score -= 15;
+                        push_note(&mut notes, "未见明确路由模式与规则集，难以确认私网/域名请求不会旁路");
+                    }
+                }
+            }
+
+            match config_hints.tun_enabled {
+                Some(true) => {
+                    if config_hints.tun_auto_route != Some(true) {
+                        score -= 5;
+                        push_note(&mut notes, "已启用 TUN，但未明确 auto-route，系统级接管能力存疑");
+                    }
+                    if config_hints.tun_strict_route != Some(true) {
+                        score -= 3;
+                        push_note(&mut notes, "已启用 TUN，但未开启 strict-route，旁路流量保护较弱");
+                    }
+                    if config_hints.tun_dns_hijack_count == 0 {
+                        score -= 5;
+                        push_note(&mut notes, "已启用 TUN，但未见 dns-hijack，系统 DNS 接管不完整");
+                    }
+                }
+                Some(false) | None => {
+                    score -= 10;
+                    push_note(&mut notes, "未启用 TUN，本机全部应用流量是否接管取决于外部客户端设置");
+                }
+            }
+
+            if config_hints.allow_lan == Some(true) && has_local_proxy_listener(config_hints) {
+                score -= 25;
+                push_note(&mut notes, "allow-lan 已开启，本机代理端口可能暴露给局域网设备");
+            }
+            if config_hints.allow_lan == Some(true)
+                && config_hints
+                    .bind_address
+                    .as_deref()
+                    .is_some_and(|address| !is_local_listener(address))
+            {
+                score -= 10;
+                push_note(&mut notes, "bind-address 并非本地回环地址，局域网访问暴露面更大");
+            }
+
+            if let Some(controller) = config_hints.external_controller.as_deref() {
+                if !config_hints.secret_present {
+                    score -= 25;
+                    push_note(
+                        &mut notes,
+                        format!("external-controller {controller} 已开启但未配置 secret"),
+                    );
+                } else if !is_local_listener(controller) {
+                    score -= 10;
+                    push_note(
+                        &mut notes,
+                        format!("external-controller {controller} 建议仅绑定本地地址"),
+                    );
+                }
+            }
+
+            if notes.is_empty() {
+                push_note(
+                    &mut notes,
+                    "订阅包含 DNS、规则与 TUN 等私流保护配置，泄露风险相对较低",
+                );
+            }
+        }
+        SubscriptionContentKind::ProxyList | SubscriptionContentKind::Unknown => {
+            let total = nodes.len() as f32;
+            let weak_transport_count = nodes
+                .iter()
+                .filter(|node| node_uses_weak_private_transport(node))
+                .count();
+            let insecure_cert_count = nodes
+                .iter()
+                .filter(|node| node.skip_cert_verify == Some(true))
+                .count();
+            let tls_like_ratio = nodes
+                .iter()
+                .filter(|node| node_uses_tls_like_private_transport(node))
+                .count() as f32
+                / total;
+
+            score = 60;
+            push_note(
+                &mut notes,
+                "订阅仅包含节点列表，未提供 DNS/规则/TUN 配置，无法实测本机 DNS/私网流量是否泄露",
+            );
+
+            if weak_transport_count > 0 {
+                score -= 20;
+                push_note(
+                    &mut notes,
+                    format!("发现 {weak_transport_count} 个明文/弱隧道节点，私流经其转发时风险较高"),
+                );
+            }
+            if insecure_cert_count > 0 {
+                score -= 15;
+                push_note(
+                    &mut notes,
+                    format!("发现 {insecure_cert_count} 个节点跳过证书校验，中间人风险较高"),
+                );
+            }
+            if weak_transport_count == 0 && insecure_cert_count == 0 && tls_like_ratio >= 0.8 {
+                score += 10;
+                push_note(&mut notes, "多数节点具备 TLS/REALITY/QUIC 类外层保护");
+            }
+        }
+    }
+
+    let level = security_level_from_score(score);
+    let reason = format!(
+        "{}；当前为订阅配置/节点特征的启发式评估，未执行真实 DNS 泄露或私网流量抓包。",
+        join_notes(&notes)
+    );
+
+    SubscriptionPrivacyAssessment { level, reason }
+}
+
+fn security_level_from_score(score: i32) -> SecurityLevel {
+    match score.clamp(0, 100) {
+        80..=100 => SecurityLevel::High,
+        55..=79 => SecurityLevel::Medium,
+        0..=54 => SecurityLevel::Low,
+        _ => SecurityLevel::Unknown,
+    }
+}
+
+fn has_local_proxy_listener(config_hints: &SubscriptionConfigHints) -> bool {
+    config_hints.mixed_port.is_some()
+        || config_hints.http_port.is_some()
+        || config_hints.socks_port.is_some()
+        || config_hints.redir_port.is_some()
+        || config_hints.tproxy_port.is_some()
+}
+
+fn is_local_listener(listener: &str) -> bool {
+    let lower = listener.trim().to_ascii_lowercase();
+    lower.starts_with("127.")
+        || lower.starts_with("localhost")
+        || lower.starts_with("::1")
+        || lower.starts_with("[::1]")
+}
+
+fn node_uses_weak_private_transport(node: &ProxyNode) -> bool {
+    let protocol = node.node_type.to_ascii_lowercase();
+    if matches!(protocol.as_str(), "http" | "socks" | "socks5") {
+        return true;
+    }
+
+    node.cipher.as_deref().is_some_and(|cipher| {
+        is_weak_cipher(&cipher.to_ascii_lowercase())
+    })
+}
+
+fn node_uses_tls_like_private_transport(node: &ProxyNode) -> bool {
+    let protocol = node.node_type.to_ascii_lowercase();
+    node.tls == Some(true)
+        || matches!(
+            protocol.as_str(),
+            "trojan" | "https" | "tuic" | "hysteria" | "hysteria2"
+        )
+        || node.security.as_deref().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "tls" | "xtls" | "reality"
+            )
+        })
 }
 
 fn dns_failed(
@@ -528,6 +804,14 @@ fn dns_failed(
             security_level: SecurityLevel::Unknown,
             encryption_level: EncryptionLevel::Unknown,
             score: 0,
+            security_reason: "无法评估：DNS失败".to_owned(),
+            encryption_reason: "无法判断加密方式：DNS失败".to_owned(),
+            gateway_level: SecurityLevel::Unknown,
+            gateway_reason: "无法评估过GW能力：DNS失败".to_owned(),
+            anti_tracking_level: SecurityLevel::Unknown,
+            anti_tracking_reason: "无法评估防追踪：DNS失败".to_owned(),
+            live_network_level: SecurityLevel::Unknown,
+            live_network_reason: "无法评估现网稳定性：DNS失败".to_owned(),
             note: "无法评估：DNS失败".to_owned(),
         },
         message: reason,
@@ -1036,6 +1320,8 @@ fn build_result(
         &node,
         &tls_probe.status,
         &udp_probe.status,
+        &ttfb_probe.status,
+        ttfb_probe.latency_ms,
         tcp_success_rate(tcp_probe.successes, attempts as usize),
         tcp_loss_percent,
         tcp_jitter_ms,
@@ -1640,6 +1926,8 @@ fn assess_security(
     node: &ProxyNode,
     tls_status: &TlsProbeStatus,
     udp_status: &UdpProbeStatus,
+    ttfb_status: &TtfbProbeStatus,
+    ttfb_ms: Option<u128>,
     tcp_success_rate: f32,
     tcp_loss_percent: f32,
     tcp_jitter_ms: Option<u128>,
@@ -1647,39 +1935,55 @@ fn assess_security(
     attempts: u8,
 ) -> SecurityAssessment {
     let protocol = node.node_type.to_ascii_lowercase();
-    let mut notes = Vec::new();
+    let mut encryption_notes = Vec::new();
+    let mut security_notes = Vec::new();
 
     let (encryption_level, encryption_score) =
-        encryption_strength(node, tls_status, &protocol, &mut notes);
+        encryption_strength(node, tls_status, &protocol, &mut encryption_notes);
     let transport_score = protocol_security_score(&protocol);
-    let tls_score = tls_security_score(tls_status, &protocol, &mut notes);
-    let udp_score = udp_security_score(udp_status, &protocol, &mut notes);
-    let cert_score = cert_validation_score(node.skip_cert_verify, &mut notes);
-    let metadata_score = metadata_security_score(node, &protocol, &mut notes);
+    let tls_score = tls_security_score(tls_status, &protocol, &mut security_notes);
+    let udp_score = udp_security_score(udp_status, &protocol, &mut security_notes);
+    let cert_score = cert_validation_score(node.skip_cert_verify, &mut security_notes);
+    let metadata_score = metadata_security_score(node, &protocol, &mut security_notes);
     let reliability_score = (tcp_success_rate.clamp(0.0, 1.0) * 10.0).round() as u8;
     let loss_score = if tcp_loss_percent <= 5.0 {
         6
     } else if tcp_loss_percent <= 15.0 {
         4
     } else {
-        notes.push(format!("TCP 丢包偏高 ({tcp_loss_percent:.1}%)"));
+        push_note(
+            &mut security_notes,
+            format!("TCP 丢包偏高 ({tcp_loss_percent:.1}%)"),
+        );
         1
     };
     let jitter_score = match tcp_jitter_ms {
         Some(jitter) if jitter <= 8 => 6,
         Some(jitter) if jitter <= 20 => 4,
         Some(jitter) => {
-            notes.push(format!("TCP 抖动偏高 ({jitter}ms)"));
+            push_note(&mut security_notes, format!("TCP 抖动偏高 ({jitter}ms)"));
             1
         }
         None => {
             if attempts > 1 {
-                notes.push("抖动样本不足".to_owned());
+                push_note(&mut security_notes, "抖动样本不足");
             }
             3
         }
     };
-    let stability_score = stability_security_score(stability, &mut notes);
+    let stability_score = stability_security_score(stability, &mut security_notes);
+    let (gateway_level, gateway_reason) = assess_gateway_profile(node, &protocol, tls_status);
+    let (anti_tracking_level, anti_tracking_reason) =
+        assess_anti_tracking_profile(node, &protocol, tls_status, &encryption_level);
+    let (live_network_level, live_network_reason) = assess_live_network_profile(
+        stability,
+        ttfb_status,
+        ttfb_ms,
+        tcp_loss_percent,
+        tcp_jitter_ms,
+        &gateway_level,
+        &anti_tracking_level,
+    );
 
     let mut score = encryption_score
         .saturating_add(transport_score)
@@ -1705,12 +2009,337 @@ fn assess_security(
         SecurityLevel::Low
     };
 
+    let encryption_reason = join_notes(&encryption_notes);
+    let security_reason = join_notes(&[
+        protocol_security_baseline_reason(node, &protocol, tls_status),
+        gateway_reason.clone(),
+        anti_tracking_reason.clone(),
+        live_network_reason.clone(),
+    ]);
+    let mut notes = Vec::new();
+    append_notes(&mut notes, &encryption_notes);
+    append_notes(&mut notes, &security_notes);
+    push_note(&mut notes, format!("过GW评估：{}", gateway_reason));
+    push_note(&mut notes, format!("防追踪评估：{}", anti_tracking_reason));
+    push_note(&mut notes, format!("现网稳定性：{}", live_network_reason));
+
     SecurityAssessment {
         security_level,
         encryption_level,
         score,
+        security_reason,
+        encryption_reason,
+        gateway_level,
+        gateway_reason,
+        anti_tracking_level,
+        anti_tracking_reason,
+        live_network_level,
+        live_network_reason,
         note: notes.join("；"),
     }
+}
+
+fn push_note(notes: &mut Vec<String>, note: impl Into<String>) {
+    let note = note.into();
+    if note.is_empty() || notes.iter().any(|item| item == &note) {
+        return;
+    }
+    notes.push(note);
+}
+
+fn append_notes(target: &mut Vec<String>, source: &[String]) {
+    for note in source {
+        push_note(target, note.clone());
+    }
+}
+
+fn join_notes(notes: &[String]) -> String {
+    notes
+        .iter()
+        .filter(|item| !item.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("；")
+}
+
+fn protocol_security_baseline_reason(
+    node: &ProxyNode,
+    protocol: &str,
+    tls_status: &TlsProbeStatus,
+) -> String {
+    let protocol_name = protocol_label(protocol);
+    if protocol == "http" {
+        return "HTTP 明文直连，协议安全基线最低".to_owned();
+    }
+
+    if matches!(protocol, "socks" | "socks5") {
+        return "SOCKS5 只做转发，安全性依赖外层隧道".to_owned();
+    }
+
+    if protocol == "ss" {
+        return node
+            .cipher
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(|cipher| format!("Shadowsocks 依赖 {cipher} 算法保护链路"))
+            .unwrap_or_else(|| "Shadowsocks 缺少 cipher 信息，安全性判断不完整".to_owned());
+    }
+
+    if uses_reality_mode(node) {
+        return format!("{protocol_name} 使用 REALITY/XTLS Vision，协议伪装基线较高");
+    }
+
+    if protocol_uses_tls_like_transport(node, protocol, tls_status) {
+        return format!("{protocol_name} 使用 TLS 类外层封装，协议安全基线较高");
+    }
+
+    format!("{protocol_name} 仍以协议层封装为主，外层伪装较弱")
+}
+
+fn assess_gateway_profile(
+    node: &ProxyNode,
+    protocol: &str,
+    tls_status: &TlsProbeStatus,
+) -> (SecurityLevel, String) {
+    let protocol_name = protocol_label(protocol);
+    let uses_tls_like = protocol_uses_tls_like_transport(node, protocol, tls_status);
+    let has_sni = has_named_value(node.server_name.as_deref());
+    let has_alpn = has_named_value(node.alpn.as_deref());
+    let http_cover = has_http_cover_transport(node);
+    let reality_mode = uses_reality_mode(node);
+
+    if protocol == "http" || matches!(protocol, "socks" | "socks5") {
+        return (
+            SecurityLevel::Low,
+            format!("{protocol_name} 缺少 TLS/REALITY 外层伪装，过GW适配度低"),
+        );
+    }
+
+    if reality_mode {
+        return (
+            SecurityLevel::High,
+            "使用 REALITY/XTLS Vision，链路外观更接近真实站点请求".to_owned(),
+        );
+    }
+
+    if matches!(protocol, "trojan" | "https") && uses_tls_like && has_sni {
+        return (
+            SecurityLevel::High,
+            "使用 TLS + SNI，外观接近常见 HTTPS 流量".to_owned(),
+        );
+    }
+
+    if uses_tls_like && has_sni && http_cover {
+        return (
+            SecurityLevel::High,
+            format!(
+                "使用 TLS + SNI + {} 传输伪装，更接近常见 Web 流量",
+                node.network.as_deref().unwrap_or("Web 类")
+            ),
+        );
+    }
+
+    if matches!(protocol, "tuic" | "hysteria" | "hysteria2") {
+        if has_alpn {
+            return (
+                SecurityLevel::Medium,
+                format!("{protocol_name} 走 QUIC/UDP，开放网络下通常较稳，但对 UDP/QUIC 策略更敏感"),
+            );
+        }
+        return (
+            SecurityLevel::Low,
+            format!("{protocol_name} 走 QUIC/UDP，但缺少 ALPN/SNI 等伪装字段，过GW风险较高"),
+        );
+    }
+
+    if uses_tls_like && (has_sni || http_cover) {
+        return (
+            SecurityLevel::Medium,
+            "具备 TLS 外层，但伪装字段不够完整，过GW能力中等".to_owned(),
+        );
+    }
+
+    (
+        SecurityLevel::Low,
+        format!("{protocol_name} 缺少 TLS/REALITY/SNI 等关键信号，过GW能力偏弱"),
+    )
+}
+
+fn assess_anti_tracking_profile(
+    node: &ProxyNode,
+    protocol: &str,
+    tls_status: &TlsProbeStatus,
+    encryption_level: &EncryptionLevel,
+) -> (SecurityLevel, String) {
+    let protocol_name = protocol_label(protocol);
+    let uses_tls_like = protocol_uses_tls_like_transport(node, protocol, tls_status);
+    let has_sni = has_named_value(node.server_name.as_deref());
+    let has_alpn = has_named_value(node.alpn.as_deref());
+    let http_cover = has_http_cover_transport(node);
+    let cert_strict = node.skip_cert_verify != Some(true);
+    let reality_mode = uses_reality_mode(node);
+
+    if matches!(encryption_level, EncryptionLevel::Plaintext | EncryptionLevel::Weak) {
+        return (
+            SecurityLevel::Low,
+            "链路加密较弱或明文，容易被侧写与关联识别".to_owned(),
+        );
+    }
+
+    if !cert_strict {
+        return (
+            SecurityLevel::Low,
+            "已跳过证书校验，指纹可信度不足，防追踪能力较弱".to_owned(),
+        );
+    }
+
+    if reality_mode || (uses_tls_like && has_sni && has_alpn && (http_cover || has_sni)) {
+        return (
+            SecurityLevel::High,
+            "TLS/REALITY 指纹字段较完整，外观更接近真实业务流量".to_owned(),
+        );
+    }
+
+    if uses_tls_like && (has_sni || has_alpn) {
+        return (
+            SecurityLevel::Medium,
+            format!("{protocol_name} 具备部分 TLS 指纹字段，但伪装完整性一般"),
+        );
+    }
+
+    (
+        SecurityLevel::Low,
+        format!("{protocol_name} 缺少 SNI/ALPN 等指纹补全字段，容易被关联识别"),
+    )
+}
+
+fn assess_live_network_profile(
+    stability: &StabilityMetrics,
+    ttfb_status: &TtfbProbeStatus,
+    ttfb_ms: Option<u128>,
+    tcp_loss_percent: f32,
+    tcp_jitter_ms: Option<u128>,
+    gateway_level: &SecurityLevel,
+    anti_tracking_level: &SecurityLevel,
+) -> (SecurityLevel, String) {
+    let ttfb_failed = matches!(ttfb_status, TtfbProbeStatus::Failed(_));
+    let jitter = tcp_jitter_ms.unwrap_or(0);
+    let gateway_low = matches!(gateway_level, SecurityLevel::Low);
+    let anti_low = matches!(anti_tracking_level, SecurityLevel::Low);
+    let ttfb_desc = match ttfb_status {
+        TtfbProbeStatus::Passed(_) => ttfb_ms
+            .map(|value| format!("TTFB {value}ms"))
+            .unwrap_or_else(|| "TTFB 通过".to_owned()),
+        TtfbProbeStatus::Failed(reason) => format!("TTFB 失败({reason})"),
+        TtfbProbeStatus::Skipped(reason) => format!("TTFB 跳过({reason})"),
+    };
+
+    if matches!(stability.level, StabilityLevel::Disabled) {
+        let level = if matches!(ttfb_status, TtfbProbeStatus::Passed(_))
+            && tcp_loss_percent <= 5.0
+            && tcp_jitter_ms.is_some_and(|value| value <= 15)
+            && !gateway_low
+            && !anti_low
+        {
+            SecurityLevel::Medium
+        } else {
+            SecurityLevel::Low
+        };
+
+        return (
+            level,
+            format!(
+                "未开启持续稳定性窗口，按 {}、丢包 {:.1}% 、抖动 {}ms 估计；过GW {}，防追踪 {}",
+                ttfb_desc,
+                tcp_loss_percent,
+                jitter,
+                gateway_level.label(),
+                anti_tracking_level.label()
+            ),
+        );
+    }
+
+    let level = if matches!(stability.level, StabilityLevel::High)
+        && tcp_loss_percent <= 5.0
+        && jitter <= 15
+        && !ttfb_failed
+        && !gateway_low
+        && !anti_low
+    {
+        SecurityLevel::High
+    } else if matches!(stability.level, StabilityLevel::Low)
+        || tcp_loss_percent > 15.0
+        || jitter > 30
+        || ttfb_failed
+        || (gateway_low && anti_low)
+    {
+        SecurityLevel::Low
+    } else {
+        SecurityLevel::Medium
+    };
+
+    (
+        level,
+        format!(
+            "窗口 {} 秒内超时率 {:.1}% 、最大连续失败 {}；{}；过GW {}，防追踪 {}",
+            stability.window_secs,
+            stability.timeout_rate_percent,
+            stability.max_consecutive_failures,
+            ttfb_desc,
+            gateway_level.label(),
+            anti_tracking_level.label()
+        ),
+    )
+}
+
+fn protocol_label(protocol: &str) -> String {
+    match protocol {
+        "ss" => "Shadowsocks".to_owned(),
+        "socks" | "socks5" => "SOCKS5".to_owned(),
+        "http" => "HTTP".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => "Unknown".to_owned(),
+            }
+        }
+    }
+}
+
+fn protocol_uses_tls_like_transport(
+    node: &ProxyNode,
+    protocol: &str,
+    tls_status: &TlsProbeStatus,
+) -> bool {
+    tls_status.is_passed()
+        || node.tls == Some(true)
+        || matches!(protocol, "trojan" | "https" | "tuic" | "hysteria" | "hysteria2")
+        || node.security.as_deref().is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "tls" | "xtls" | "reality"
+            )
+        })
+}
+
+fn uses_reality_mode(node: &ProxyNode) -> bool {
+    node.security.as_deref().is_some_and(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "reality" | "xtls")
+    }) || node.flow.as_deref().is_some_and(|value| value.to_ascii_lowercase().contains("vision"))
+}
+
+fn has_http_cover_transport(node: &ProxyNode) -> bool {
+    node.network.as_deref().is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "ws" | "grpc" | "h2" | "http"
+        )
+    })
+}
+
+fn has_named_value(value: Option<&str>) -> bool {
+    value.is_some_and(|item| !item.trim().is_empty())
 }
 
 fn encryption_strength(
@@ -1720,7 +2349,7 @@ fn encryption_strength(
     notes: &mut Vec<String>,
 ) -> (EncryptionLevel, u8) {
     if protocol == "http" {
-        notes.push("HTTP 为明文传输".to_owned());
+        push_note(notes, "HTTP 为明文传输");
         return (EncryptionLevel::Plaintext, 0);
     }
 
@@ -1728,17 +2357,18 @@ fn encryption_strength(
         if let Some(cipher) = node.cipher.as_deref() {
             let cipher_l = cipher.to_ascii_lowercase();
             if is_strong_cipher(&cipher_l) {
+                push_note(notes, format!("Shadowsocks 使用 {cipher} 加密"));
                 return (EncryptionLevel::Strong, 40);
             }
             if is_weak_cipher(&cipher_l) {
-                notes.push(format!("SS 使用弱加密算法 {cipher}"));
+                push_note(notes, format!("Shadowsocks 使用弱加密算法 {cipher}"));
                 return (EncryptionLevel::Weak, 12);
             }
-            notes.push(format!("SS 使用中等强度算法 {cipher}"));
+            push_note(notes, format!("Shadowsocks 使用中等强度算法 {cipher}"));
             return (EncryptionLevel::Moderate, 26);
         }
 
-        notes.push("SS 未提供 cipher 信息".to_owned());
+        push_note(notes, "Shadowsocks 未提供 cipher 信息");
         return (EncryptionLevel::Unknown, 18);
     }
 
@@ -1746,19 +2376,33 @@ fn encryption_strength(
         protocol,
         "trojan" | "https" | "tuic" | "hysteria" | "hysteria2"
     ) {
+        if matches!(protocol, "tuic" | "hysteria" | "hysteria2") {
+            push_note(notes, format!("{} 使用 QUIC/TLS 类加密", protocol_label(protocol)));
+        } else {
+            push_note(notes, format!("{} 使用 TLS 外层加密", protocol_label(protocol)));
+        }
         return (EncryptionLevel::Strong, 40);
     }
 
     if matches!(protocol, "vmess" | "vless") {
         if node.tls == Some(true) || tls_status.is_passed() {
+            let outer = node
+                .security
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("TLS");
+            push_note(
+                notes,
+                format!("{} 使用 {} 外层加密", protocol_label(protocol), outer),
+            );
             return (EncryptionLevel::Strong, 35);
         }
-        notes.push("VMess/VLESS 未确认 TLS/REALITY".to_owned());
+        push_note(notes, "VMess/VLESS 未确认 TLS/REALITY");
         return (EncryptionLevel::Moderate, 24);
     }
 
     if matches!(protocol, "socks" | "socks5") {
-        notes.push("SOCKS5 默认不加密，依赖外层隧道".to_owned());
+        push_note(notes, "SOCKS5 默认不加密，依赖外层隧道");
         return (EncryptionLevel::Weak, 10);
     }
 
@@ -1781,19 +2425,19 @@ fn tls_security_score(tls_status: &TlsProbeStatus, protocol: &str, notes: &mut V
         TlsProbeStatus::Passed => 20,
         TlsProbeStatus::Failed(reason) => {
             if should_probe_tls(protocol) {
-                notes.push(format!("TLS 预检失败：{reason}"));
+                push_note(notes, format!("TLS 预检失败：{reason}"));
             }
             2
         }
         TlsProbeStatus::Disabled => {
             if should_probe_tls(protocol) {
-                notes.push("TLS 检测被关闭".to_owned());
+                push_note(notes, "TLS 检测被关闭");
             }
             8
         }
         TlsProbeStatus::Skipped(reason) => {
             if should_probe_tls(protocol) {
-                notes.push(format!("TLS 跳过：{reason}"));
+                push_note(notes, format!("TLS 跳过：{reason}"));
                 8
             } else {
                 12
@@ -1810,11 +2454,11 @@ fn udp_security_score(udp_status: &UdpProbeStatus, protocol: &str, notes: &mut V
     match udp_status {
         UdpProbeStatus::Passed(_) => 8,
         UdpProbeStatus::Partial(reason) => {
-            notes.push(format!("UDP 部分通过：{reason}"));
+            push_note(notes, format!("UDP 部分通过：{reason}"));
             4
         }
         UdpProbeStatus::Failed(reason) => {
-            notes.push(format!("UDP 失败：{reason}"));
+            push_note(notes, format!("UDP 失败：{reason}"));
             if is_udp_required_protocol(protocol) {
                 0
             } else {
@@ -1822,7 +2466,7 @@ fn udp_security_score(udp_status: &UdpProbeStatus, protocol: &str, notes: &mut V
             }
         }
         UdpProbeStatus::Skipped(reason) => {
-            notes.push(format!("UDP 跳过：{reason}"));
+            push_note(notes, format!("UDP 跳过：{reason}"));
             if is_udp_required_protocol(protocol) {
                 1
             } else {
@@ -1837,14 +2481,14 @@ fn stability_security_score(stability: &StabilityMetrics, notes: &mut Vec<String
         StabilityLevel::Disabled => 6,
         StabilityLevel::High => 10,
         StabilityLevel::Medium => {
-            notes.push(format!(
+            push_note(notes, format!(
                 "稳定性中等：超时率 {:.1}%，最大连续失败 {}",
                 stability.timeout_rate_percent, stability.max_consecutive_failures
             ));
             6
         }
         StabilityLevel::Low => {
-            notes.push(format!(
+            push_note(notes, format!(
                 "稳定性较差：超时率 {:.1}%，最大连续失败 {}",
                 stability.timeout_rate_percent, stability.max_consecutive_failures
             ));
@@ -1856,12 +2500,12 @@ fn stability_security_score(stability: &StabilityMetrics, notes: &mut Vec<String
 fn cert_validation_score(skip_cert_verify: Option<bool>, notes: &mut Vec<String>) -> u8 {
     match skip_cert_verify {
         Some(true) => {
-            notes.push("已配置跳过证书校验".to_owned());
+            push_note(notes, "已配置跳过证书校验");
             0
         }
         Some(false) => 10,
         None => {
-            notes.push("证书校验策略未知".to_owned());
+            push_note(notes, "证书校验策略未知");
             6
         }
     }
@@ -1873,7 +2517,7 @@ fn metadata_security_score(node: &ProxyNode, protocol: &str, notes: &mut Vec<Str
     if let Some(network) = node.network.as_deref() {
         let network_l = network.to_ascii_lowercase();
         if matches!(network_l.as_str(), "grpc" | "ws" | "h2" | "http") {
-            notes.push(format!("传输层: {network}"));
+            push_note(notes, format!("传输层: {network}"));
             score = score.saturating_add(2);
         }
     }
@@ -1882,7 +2526,7 @@ fn metadata_security_score(node: &ProxyNode, protocol: &str, notes: &mut Vec<Str
         if node.server_name.is_some() {
             score = score.saturating_add(3);
         } else {
-            notes.push("TLS 类节点未发现 SNI/ServerName".to_owned());
+            push_note(notes, "TLS 类节点未发现 SNI/ServerName");
         }
     }
 
@@ -1949,5 +2593,131 @@ mod tests {
             hex_sha224("test"),
             "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809"
         );
+    }
+
+    #[test]
+    fn assesses_trojan_security_reasons() {
+        let node = ProxyNode {
+            node_type: "trojan".to_owned(),
+            server: "example.com".to_owned(),
+            port: 443,
+            tls: Some(true),
+            server_name: Some("cdn.example.com".to_owned()),
+            alpn: Some("h2".to_owned()),
+            skip_cert_verify: Some(false),
+            ..ProxyNode::default()
+        };
+
+        let assessment = assess_security(
+            &node,
+            &TlsProbeStatus::Passed,
+            &UdpProbeStatus::Passed("收到响应".to_owned()),
+            &TtfbProbeStatus::Passed("收到首包".to_owned()),
+            Some(320),
+            1.0,
+            0.0,
+            Some(6),
+            &StabilityMetrics {
+                window_secs: 30,
+                samples: 30,
+                failures: 0,
+                timeout_rate_percent: 0.0,
+                max_consecutive_failures: 0,
+                level: StabilityLevel::High,
+            },
+            3,
+        );
+
+        assert!(assessment.encryption_reason.contains("Trojan"));
+        assert!(assessment.encryption_reason.contains("TLS"));
+        assert_eq!(assessment.gateway_level, SecurityLevel::High);
+        assert_eq!(assessment.anti_tracking_level, SecurityLevel::High);
+        assert_eq!(assessment.live_network_level, SecurityLevel::High);
+    }
+
+    #[test]
+    fn marks_weak_anti_tracking_for_plain_socks() {
+        let node = ProxyNode {
+            node_type: "socks5".to_owned(),
+            server: "example.com".to_owned(),
+            port: 1080,
+            ..ProxyNode::default()
+        };
+
+        let assessment = assess_security(
+            &node,
+            &TlsProbeStatus::Skipped("协议默认跳过".to_owned()),
+            &UdpProbeStatus::Skipped("协议默认跳过".to_owned()),
+            &TtfbProbeStatus::Skipped("未定义".to_owned()),
+            None,
+            1.0,
+            2.0,
+            Some(8),
+            &StabilityMetrics::disabled(),
+            1,
+        );
+
+        assert_eq!(assessment.encryption_level, EncryptionLevel::Weak);
+        assert_eq!(assessment.gateway_level, SecurityLevel::Low);
+        assert_eq!(assessment.anti_tracking_level, SecurityLevel::Low);
+        assert!(assessment.live_network_reason.contains("未开启持续稳定性窗口"));
+    }
+
+    #[test]
+    fn rates_private_traffic_safety_high_for_guarded_clash_yaml() {
+        let hints = SubscriptionConfigHints {
+            kind: SubscriptionContentKind::ClashYaml,
+            dns_enabled: Some(true),
+            dns_listen: Some("0.0.0.0:1053".to_owned()),
+            dns_enhanced_mode: Some("fake-ip".to_owned()),
+            dns_nameserver_count: 2,
+            dns_fallback_count: 1,
+            dns_respect_rules: Some(true),
+            mode: Some("rule".to_owned()),
+            allow_lan: Some(false),
+            bind_address: Some("127.0.0.1".to_owned()),
+            mixed_port: Some(7890),
+            tun_enabled: Some(true),
+            tun_auto_route: Some(true),
+            tun_strict_route: Some(true),
+            tun_dns_hijack_count: 1,
+            rule_count: 5,
+            rule_provider_count: 2,
+            external_controller: Some("127.0.0.1:9090".to_owned()),
+            secret_present: true,
+            ..SubscriptionConfigHints::default()
+        };
+        let nodes = vec![ProxyNode {
+            node_type: "trojan".to_owned(),
+            server: "example.com".to_owned(),
+            port: 443,
+            tls: Some(true),
+            ..ProxyNode::default()
+        }];
+
+        let assessment = assess_subscription_local_privacy(&hints, &nodes);
+
+        assert_eq!(assessment.level, SecurityLevel::High);
+        assert!(assessment.reason.contains("启发式评估"));
+    }
+
+    #[test]
+    fn rates_private_traffic_safety_low_for_node_list_without_guards() {
+        let hints = SubscriptionConfigHints {
+            kind: SubscriptionContentKind::ProxyList,
+            ..SubscriptionConfigHints::default()
+        };
+        let nodes = vec![ProxyNode {
+            node_type: "socks5".to_owned(),
+            server: "example.com".to_owned(),
+            port: 1080,
+            skip_cert_verify: Some(true),
+            ..ProxyNode::default()
+        }];
+
+        let assessment = assess_subscription_local_privacy(&hints, &nodes);
+
+        assert_eq!(assessment.level, SecurityLevel::Low);
+        assert!(assessment.reason.contains("节点列表"));
     }
 }
