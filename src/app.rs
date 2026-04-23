@@ -8,7 +8,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::checker::{
     start_check, CheckEvent, CheckOptions, EncryptionLevel, NodeCheckResult, NodeStatus,
-    SecurityLevel, StartSummary, TlsProbeStatus,
+    ProtocolProbeStatus, SecurityLevel, StartSummary, TlsProbeStatus,
 };
 
 pub struct ClashCheckerApp {
@@ -99,9 +99,10 @@ impl ClashCheckerApp {
                         self.results.push(result);
                         let checked = self.results.len();
                         self.status_line = format!(
-                            "已检测 {checked}/{} | TCP可连 {} | 严格通过 {} | 失败 {}",
+                            "已检测 {checked}/{} | TCP可连 {} | 协议通过 {} | 严格通过 {} | 失败 {}",
                             self.start_summary.total.max(checked),
                             self.tcp_alive_count(),
+                            self.protocol_probe_pass_count(),
                             self.pass_count(),
                             self.fail_count()
                         );
@@ -109,9 +110,10 @@ impl ClashCheckerApp {
                     CheckEvent::Finished => {
                         self.checking = false;
                         self.status_line = format!(
-                            "检测完成：共 {} 个，TCP可连 {} 个，严格通过 {} 个，失败 {} 个",
+                            "检测完成：共 {} 个，TCP可连 {} 个，协议通过 {} 个，严格通过 {} 个，失败 {} 个",
                             self.results.len(),
                             self.tcp_alive_count(),
+                            self.protocol_probe_pass_count(),
                             self.pass_count(),
                             self.fail_count()
                         );
@@ -167,6 +169,32 @@ impl ClashCheckerApp {
         self.results
             .iter()
             .filter(|result| result.tls_status.is_passed())
+            .count()
+    }
+
+    fn protocol_probe_pass_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.protocol_probe.is_passed())
+            .count()
+    }
+
+    fn protocol_probe_fail_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| matches!(result.protocol_probe, ProtocolProbeStatus::Failed(_)))
+            .count()
+    }
+
+    fn protocol_probe_partial_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.protocol_probe,
+                    ProtocolProbeStatus::Partial(_) | ProtocolProbeStatus::Skipped(_)
+                )
+            })
             .count()
     }
 
@@ -286,6 +314,21 @@ impl ClashCheckerApp {
                 "TLS目标",
                 self.start_summary.tls_target_count.to_string(),
             );
+            summary_tile(
+                ui,
+                "协议通过",
+                format!(
+                    "{} ({:.1}%)",
+                    self.protocol_probe_pass_count(),
+                    self.percent(self.protocol_probe_pass_count())
+                ),
+            );
+            summary_tile(
+                ui,
+                "协议部分",
+                self.protocol_probe_partial_count().to_string(),
+            );
+            summary_tile(ui, "协议失败", self.protocol_probe_fail_count().to_string());
         });
 
         ui.add_space(8.0);
@@ -401,6 +444,7 @@ impl ClashCheckerApp {
             .column(Column::initial(80.0).at_least(60.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(240.0).at_least(160.0))
             .column(Column::initial(360.0).at_least(220.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
@@ -424,6 +468,9 @@ impl ClashCheckerApp {
                 });
                 header.col(|ui| {
                     ui.strong("TCP成功");
+                });
+                header.col(|ui| {
+                    ui.strong("协议探测");
                 });
                 header.col(|ui| {
                     ui.strong("TLS");
@@ -470,6 +517,27 @@ impl ClashCheckerApp {
                     });
                     row.col(|ui| {
                         ui.label(format!("{}/{}", result.tcp_successes, result.tcp_attempts));
+                    });
+                    row.col(|ui| {
+                        let (probe_text, probe_color) = match &result.protocol_probe {
+                            ProtocolProbeStatus::Passed(message) => (
+                                format!("通过({message})"),
+                                egui::Color32::from_rgb(32, 145, 91),
+                            ),
+                            ProtocolProbeStatus::Partial(message) => (
+                                format!("部分({message})"),
+                                egui::Color32::from_rgb(194, 122, 0),
+                            ),
+                            ProtocolProbeStatus::Failed(message) => (
+                                format!("失败({message})"),
+                                egui::Color32::from_rgb(190, 64, 64),
+                            ),
+                            ProtocolProbeStatus::Skipped(message) => {
+                                (format!("跳过({message})"), ui.visuals().weak_text_color())
+                            }
+                        };
+                        let response = ui.colored_label(probe_color, short_text(&probe_text, 30));
+                        response.on_hover_text(probe_text);
                     });
                     row.col(|ui| {
                         let (tls_text, tls_color) = match &result.tls_status {
@@ -667,7 +735,7 @@ impl eframe::App for ClashCheckerApp {
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_min_width(2400.0);
+                            ui.set_min_width(2850.0);
                             self.table_ui(ui, &filtered_indices);
                         });
                 }
@@ -693,6 +761,7 @@ impl eframe::App for ClashCheckerApp {
                     ui.heading("各列含义");
                     ui.label("TCP均延迟：TCP 成功采样的平均耗时。");
                     ui.label("TCP成功：采样成功次数 / 采样总次数。");
+                    ui.label("协议探测：按协议检查关键认证字段与握手前置条件。");
                     ui.label("TLS：对 TLS 类协议执行 ClientHello 预检的结果。");
                     ui.label("安全：综合协议、TLS、证书校验、稳定性得出的安全等级。");
                     ui.label("加密：根据协议和可见配置推断的加密强度。");
@@ -708,6 +777,7 @@ impl eframe::App for ClashCheckerApp {
                     ui.heading("详情查看");
                     ui.label("双击列表任意节点，可打开“节点详细信息”窗口。");
                     ui.label("详细信息里会显示协议参数、TLS状态、安全等级、评分与评估说明。");
+                    ui.label("协议探测=跳过：通常表示该协议真实握手将在后续版本补齐。");
                     ui.add_space(8.0);
 
                     ui.heading("常见疑问");
@@ -774,6 +844,7 @@ impl eframe::App for ClashCheckerApp {
                                     TlsProbeStatus::Failed(reason) => format!("失败 ({reason})"),
                                 },
                             );
+                            detail_row(ui, "协议探测", &result.protocol_probe.short_label());
                             detail_row(ui, "安全等级", result.security.security_level.label());
                             detail_row(ui, "加密等级", result.security.encryption_level.label());
                             detail_row(ui, "安全评分", &format!("{} / 100", result.security.score));
@@ -784,6 +855,13 @@ impl eframe::App for ClashCheckerApp {
                                 &option_bool_text(result.node.skip_cert_verify),
                             );
                             detail_row(ui, "Cipher", &option_text(result.node.cipher.as_deref()));
+                            detail_row(
+                                ui,
+                                "Security",
+                                &option_text(result.node.security.as_deref()),
+                            );
+                            detail_row(ui, "Flow", &option_text(result.node.flow.as_deref()));
+                            detail_row(ui, "ALPN", &option_text(result.node.alpn.as_deref()));
                             detail_row(ui, "Network", &option_text(result.node.network.as_deref()));
                             detail_row(
                                 ui,

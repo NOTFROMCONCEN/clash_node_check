@@ -14,6 +14,12 @@ pub struct ProxyNode {
     pub cipher: Option<String>,
     pub network: Option<String>,
     pub server_name: Option<String>,
+    pub uuid: Option<String>,
+    pub password: Option<String>,
+    pub flow: Option<String>,
+    pub security: Option<String>,
+    pub alpn: Option<String>,
+    pub udp: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +41,12 @@ struct ClashProxy {
     network: Option<String>,
     sni: Option<String>,
     servername: Option<String>,
+    uuid: Option<String>,
+    password: Option<String>,
+    flow: Option<String>,
+    security: Option<String>,
+    alpn: Option<StringOrList>,
+    udp: Option<BoolValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +77,39 @@ impl BoolValue {
         match self {
             Self::Bool(value) => Some(*value),
             Self::Text(value) => parse_bool_text(value),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringOrList {
+    Text(String),
+    List(Vec<String>),
+}
+
+impl StringOrList {
+    fn as_text(&self) -> Option<String> {
+        match self {
+            Self::Text(value) => {
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value.clone())
+                }
+            }
+            Self::List(values) => {
+                let non_empty = values
+                    .iter()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .collect::<Vec<_>>();
+                if non_empty.is_empty() {
+                    None
+                } else {
+                    Some(non_empty.join(","))
+                }
+            }
         }
     }
 }
@@ -109,6 +154,12 @@ fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>, serde_yaml::Error> 
                 cipher: proxy.cipher,
                 network: proxy.network,
                 server_name: proxy.sni.or(proxy.servername),
+                uuid: proxy.uuid,
+                password: proxy.password,
+                flow: proxy.flow,
+                security: proxy.security,
+                alpn: proxy.alpn.and_then(|value| value.as_text()),
+                udp: proxy.udp.and_then(|value| value.as_bool()),
             })
         })
         .collect();
@@ -161,6 +212,12 @@ fn parse_proxy_uri_line(line: &str) -> Option<ProxyNode> {
         cipher: infer_cipher(&query_map),
         network: infer_network(&query_map),
         server_name: infer_server_name(&query_map),
+        uuid: infer_uuid(&query_map),
+        password: infer_password(&query_map),
+        flow: infer_flow(&query_map),
+        security: infer_security(&query_map),
+        alpn: infer_alpn(&query_map),
+        udp: infer_udp(&query_map),
     })
 }
 
@@ -280,6 +337,57 @@ fn infer_server_name(query_map: &HashMap<String, String>) -> Option<String> {
     for key in candidates {
         if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
             return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_uuid(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["uuid", "id"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_password(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["password", "passwd", "token"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_flow(query_map: &HashMap<String, String>) -> Option<String> {
+    query_map
+        .get("flow")
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
+fn infer_security(query_map: &HashMap<String, String>) -> Option<String> {
+    query_map
+        .get("security")
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
+fn infer_alpn(query_map: &HashMap<String, String>) -> Option<String> {
+    query_map
+        .get("alpn")
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
+fn infer_udp(query_map: &HashMap<String, String>) -> Option<bool> {
+    let candidates = ["udp", "udp-relay"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).and_then(|value| parse_bool_text(value)) {
+            return Some(value);
         }
     }
     None

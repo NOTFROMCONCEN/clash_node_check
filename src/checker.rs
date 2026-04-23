@@ -51,6 +51,33 @@ pub enum NodeStatus {
     Fail,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProtocolProbeStatus {
+    Passed(String),
+    Partial(String),
+    Failed(String),
+    Skipped(String),
+}
+
+impl ProtocolProbeStatus {
+    pub fn short_label(&self) -> String {
+        match self {
+            Self::Passed(message) => format!("通过({message})"),
+            Self::Partial(message) => format!("部分({message})"),
+            Self::Failed(message) => format!("失败({message})"),
+            Self::Skipped(message) => format!("跳过({message})"),
+        }
+    }
+
+    pub fn is_passed(&self) -> bool {
+        matches!(self, Self::Passed(_))
+    }
+
+    pub fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed(_))
+    }
+}
+
 impl NodeStatus {
     pub fn label(&self) -> &'static str {
         match self {
@@ -142,6 +169,7 @@ pub struct NodeCheckResult {
     pub tcp_avg_latency_ms: Option<u128>,
     pub tls_status: TlsProbeStatus,
     pub tls_latency_ms: Option<u128>,
+    pub protocol_probe: ProtocolProbeStatus,
     pub security: SecurityAssessment,
     pub message: String,
 }
@@ -339,6 +367,7 @@ fn dns_failed(node: ProxyNode, reason: String, attempts: u8) -> NodeCheckResult 
         tcp_avg_latency_ms: None,
         tls_status: TlsProbeStatus::Skipped("DNS失败".to_owned()),
         tls_latency_ms: None,
+        protocol_probe: ProtocolProbeStatus::Skipped("DNS失败".to_owned()),
         security: SecurityAssessment {
             security_level: SecurityLevel::Unknown,
             encryption_level: EncryptionLevel::Unknown,
@@ -523,11 +552,20 @@ fn build_result(
 ) -> NodeCheckResult {
     let tcp_avg_latency_ms = average(&tcp_probe.latencies_ms);
     let tcp_ok = tcp_probe.successes > 0;
+    let protocol_probe =
+        run_protocol_probe(&node, &tls_probe.status, tcp_probe.successes, attempts);
+    let protocol_failed = protocol_probe.is_failed();
+    let protocol_partial = matches!(protocol_probe, ProtocolProbeStatus::Partial(_));
+    let protocol_skipped = matches!(protocol_probe, ProtocolProbeStatus::Skipped(_));
     let tls_failed = matches!(tls_probe.status, TlsProbeStatus::Failed(_));
 
-    let status = if !tcp_ok {
+    let status = if !tcp_ok || protocol_failed {
         NodeStatus::Fail
-    } else if tls_failed || tcp_probe.successes < attempts as usize {
+    } else if tls_failed
+        || tcp_probe.successes < attempts as usize
+        || protocol_partial
+        || protocol_skipped
+    {
         NodeStatus::Warn
     } else {
         NodeStatus::Pass
@@ -539,6 +577,7 @@ fn build_result(
         attempts as usize,
         tcp_avg_latency_ms,
         &tls_probe.status,
+        &protocol_probe,
         tcp_probe.last_error.as_deref(),
     );
     let security = assess_security(&node, &tls_probe.status, tcp_probe.successes, attempts);
@@ -552,6 +591,7 @@ fn build_result(
         tcp_avg_latency_ms,
         tls_status: tls_probe.status,
         tls_latency_ms: tls_probe.latency_ms,
+        protocol_probe,
         security,
         message,
     }
@@ -563,6 +603,7 @@ fn compose_message(
     attempts: usize,
     tcp_avg_latency_ms: Option<u128>,
     tls_status: &TlsProbeStatus,
+    protocol_probe: &ProtocolProbeStatus,
     last_tcp_error: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
@@ -574,7 +615,83 @@ fn compose_message(
         parts.push(format!("TCP失败 {error}"));
     }
     parts.push(format!("TLS {}", tls_status.short_label()));
+    parts.push(format!("协议 {}", protocol_probe.short_label()));
     parts.join(" | ")
+}
+
+fn run_protocol_probe(
+    node: &ProxyNode,
+    tls_status: &TlsProbeStatus,
+    tcp_successes: usize,
+    attempts: u8,
+) -> ProtocolProbeStatus {
+    let protocol = node.node_type.to_ascii_lowercase();
+
+    if tcp_successes == 0 {
+        return ProtocolProbeStatus::Failed("TCP不可达".to_owned());
+    }
+
+    if tcp_successes < attempts as usize {
+        return ProtocolProbeStatus::Partial("TCP采样未全通过".to_owned());
+    }
+
+    match protocol.as_str() {
+        "trojan" => {
+            if node.password.is_none() {
+                ProtocolProbeStatus::Failed("缺少 password".to_owned())
+            } else if !matches!(tls_status, TlsProbeStatus::Passed) {
+                ProtocolProbeStatus::Partial("需要TLS通过".to_owned())
+            } else {
+                ProtocolProbeStatus::Passed("password+TLS就绪".to_owned())
+            }
+        }
+        "vmess" | "vless" => {
+            if node.uuid.is_none() {
+                ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned())
+            } else if node
+                .security
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+            {
+                ProtocolProbeStatus::Partial("security=none".to_owned())
+            } else if node.tls == Some(true) && !matches!(tls_status, TlsProbeStatus::Passed) {
+                ProtocolProbeStatus::Partial("TLS要求未满足".to_owned())
+            } else if protocol == "vless"
+                && node
+                    .flow
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("xtls-rprx-vision"))
+                && !matches!(tls_status, TlsProbeStatus::Passed)
+            {
+                ProtocolProbeStatus::Partial("VISION 需要 TLS/REALITY".to_owned())
+            } else {
+                ProtocolProbeStatus::Passed("身份字段完整".to_owned())
+            }
+        }
+        "tuic" => {
+            if node.uuid.is_none() || node.password.is_none() {
+                ProtocolProbeStatus::Failed("缺少 uuid/password".to_owned())
+            } else if node.udp == Some(false) {
+                ProtocolProbeStatus::Failed("UDP被禁用".to_owned())
+            } else if node.alpn.is_none() {
+                ProtocolProbeStatus::Partial("建议配置 ALPN".to_owned())
+            } else {
+                ProtocolProbeStatus::Skipped("QUIC真实握手待实现".to_owned())
+            }
+        }
+        "hysteria" | "hysteria2" => {
+            if node.password.is_none() && node.uuid.is_none() {
+                ProtocolProbeStatus::Failed("缺少认证字段".to_owned())
+            } else if node.udp == Some(false) {
+                ProtocolProbeStatus::Failed("UDP被禁用".to_owned())
+            } else if node.alpn.is_none() {
+                ProtocolProbeStatus::Partial("建议配置 ALPN".to_owned())
+            } else {
+                ProtocolProbeStatus::Skipped("QUIC真实握手待实现".to_owned())
+            }
+        }
+        _ => ProtocolProbeStatus::Skipped("该协议未配置握手探测".to_owned()),
+    }
 }
 
 fn should_probe_tls(node_type: &str) -> bool {
