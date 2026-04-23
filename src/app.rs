@@ -18,6 +18,7 @@ pub struct ClashCheckerApp {
     workers: u32,
     enable_tls_probe: bool,
     checking: bool,
+    show_metric_guide: bool,
     status_line: String,
     start_summary: StartSummary,
     results: Vec<NodeCheckResult>,
@@ -35,6 +36,7 @@ impl ClashCheckerApp {
             workers: 24,
             enable_tls_probe: true,
             checking: false,
+            show_metric_guide: false,
             status_line: "输入 Clash 订阅地址后开始检测".to_owned(),
             start_summary: StartSummary::default(),
             results: Vec::new(),
@@ -341,6 +343,21 @@ impl eframe::App for ClashCheckerApp {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("说明", |ui| {
+                    if ui.button("指标说明").clicked() {
+                        self.show_metric_guide = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("状态颜色说明").clicked() {
+                        self.show_metric_guide = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Clash 订阅节点多项检测");
             ui.add_space(8.0);
@@ -406,6 +423,42 @@ impl eframe::App for ClashCheckerApp {
                 }
             });
         });
+
+        if self.show_metric_guide {
+            egui::Window::new("指标说明")
+                .open(&mut self.show_metric_guide)
+                .resizable(true)
+                .default_width(760.0)
+                .show(ctx, |ui| {
+                    ui.heading("结果怎么读");
+                    ui.label("总节点：本次解析到的节点数量。");
+                    ui.label("TCP可连：至少一次 TCP 连接成功的节点数。");
+                    ui.label("严格通过：TCP 采样全部成功，且 TLS 预检通过。");
+                    ui.label(
+                        "部分通过：TCP 可连，但未达到严格通过（比如 TLS 失败或采样非全成功）。",
+                    );
+                    ui.label("失败：DNS 无法解析或 TCP 全部失败。");
+                    ui.add_space(8.0);
+
+                    ui.heading("各列含义");
+                    ui.label("TCP均延迟：TCP 成功采样的平均耗时。");
+                    ui.label("TCP成功：采样成功次数 / 采样总次数。");
+                    ui.label("TLS：对 TLS 类协议执行 ClientHello 预检的结果。");
+                    ui.label("状态：将 DNS/TCP/TLS 汇总后的最终判定与简要原因。");
+                    ui.add_space(8.0);
+
+                    ui.heading("常见疑问");
+                    ui.label("“TLS 失败 (failed to fill whole buffer)” 通常不代表订阅链接有问题。");
+                    ui.label("这更常见于节点服务端策略或预检方式兼容性导致的握手未返回完整响应。");
+                    ui.label("如果 TCP 持续 3/3 成功，这个节点在真实客户端里仍可能可用。");
+                    ui.add_space(8.0);
+
+                    ui.heading("状态颜色");
+                    ui.label("绿色：通过（指标整体健康）。");
+                    ui.label("橙色：部分通过（有风险项，建议复测）。");
+                    ui.label("红色：失败（当前检测项不通过）。");
+                });
+        }
     }
 }
 
