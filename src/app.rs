@@ -174,7 +174,6 @@ impl ClashCheckerApp {
                     });
                     row.col(|ui| {
                         let color = match result.status {
-                            NodeStatus::Pending => ui.visuals().weak_text_color(),
                             NodeStatus::Alive => egui::Color32::from_rgb(32, 145, 91),
                             NodeStatus::Dead => egui::Color32::from_rgb(190, 64, 64),
                         };

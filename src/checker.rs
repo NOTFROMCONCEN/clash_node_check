@@ -28,7 +28,6 @@ pub enum CheckEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeStatus {
-    Pending,
     Alive,
     Dead,
 }
@@ -36,7 +35,6 @@ pub enum NodeStatus {
 impl NodeStatus {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Pending => "等待",
             Self::Alive => "存活",
             Self::Dead => "失败",
         }
@@ -49,17 +47,6 @@ pub struct NodeCheckResult {
     pub status: NodeStatus,
     pub latency_ms: Option<u128>,
     pub message: String,
-}
-
-impl NodeCheckResult {
-    pub fn pending(node: ProxyNode) -> Self {
-        Self {
-            node,
-            status: NodeStatus::Pending,
-            latency_ms: None,
-            message: "等待检测".to_owned(),
-        }
-    }
 }
 
 pub fn start_check(subscription_url: String, options: CheckOptions, tx: Sender<CheckEvent>) {
