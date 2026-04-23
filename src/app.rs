@@ -25,6 +25,7 @@ pub struct ClashCheckerApp {
     show_metric_guide: bool,
     show_node_detail: bool,
     selected_result_index: Option<usize>,
+    table_mode: TableMode,
     status_line: String,
     start_summary: StartSummary,
     results: Vec<NodeCheckResult>,
@@ -48,6 +49,7 @@ impl ClashCheckerApp {
             show_metric_guide: false,
             show_node_detail: false,
             selected_result_index: None,
+            table_mode: TableMode::Compact,
             status_line: "输入 Clash 订阅地址后开始检测".to_owned(),
             start_summary: StartSummary::default(),
             results: Vec::new(),
@@ -507,6 +509,177 @@ impl ClashCheckerApp {
     }
 
     fn table_ui(&mut self, ui: &mut egui::Ui, row_indices: &[usize]) {
+        match self.table_mode {
+            TableMode::Compact => self.table_ui_compact(ui, row_indices),
+            TableMode::Full => self.table_ui_full(ui, row_indices),
+        }
+    }
+
+    fn table_ui_compact(&mut self, ui: &mut egui::Ui, row_indices: &[usize]) {
+        TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .sense(egui::Sense::click())
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(280.0).at_least(180.0))
+            .column(Column::initial(80.0).at_least(64.0))
+            .column(Column::initial(260.0).at_least(160.0))
+            .column(Column::initial(80.0).at_least(60.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(190.0).at_least(140.0))
+            .column(Column::initial(190.0).at_least(140.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(560.0).at_least(300.0))
+            .header(28.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("节点");
+                });
+                header.col(|ui| {
+                    ui.strong("协议");
+                });
+                header.col(|ui| {
+                    ui.strong("服务器");
+                });
+                header.col(|ui| {
+                    ui.strong("端口");
+                });
+                header.col(|ui| {
+                    ui.strong("TCP均延迟");
+                });
+                header.col(|ui| {
+                    ui.strong("TCP成功");
+                });
+                header.col(|ui| {
+                    ui.strong("TLS");
+                });
+                header.col(|ui| {
+                    ui.strong("UDP");
+                });
+                header.col(|ui| {
+                    ui.strong("安全");
+                });
+                header.col(|ui| {
+                    ui.strong("评分");
+                });
+                header.col(|ui| {
+                    ui.strong("状态");
+                });
+            })
+            .body(|body| {
+                body.rows(28.0, row_indices.len(), |mut row| {
+                    let result_index = row_indices[row.index()];
+                    let is_selected = self.selected_result_index == Some(result_index);
+                    row.set_selected(is_selected);
+
+                    let result = &self.results[result_index];
+                    row.col(|ui| {
+                        ui.label(&result.node.name);
+                    });
+                    row.col(|ui| {
+                        ui.label(&result.node.node_type);
+                    });
+                    row.col(|ui| {
+                        ui.label(&result.node.server);
+                    });
+                    row.col(|ui| {
+                        ui.label(result.node.port.to_string());
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            result
+                                .tcp_avg_latency_ms
+                                .map(|value| format!("{value} ms"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{}/{}", result.tcp_successes, result.tcp_attempts));
+                    });
+                    row.col(|ui| {
+                        let (tls_text, tls_color) = match &result.tls_status {
+                            TlsProbeStatus::Passed => (
+                                result
+                                    .tls_latency_ms
+                                    .map(|latency| format!("通过 {latency}ms"))
+                                    .unwrap_or_else(|| "通过".to_owned()),
+                                egui::Color32::from_rgb(32, 145, 91),
+                            ),
+                            TlsProbeStatus::Disabled => {
+                                ("关闭".to_owned(), ui.visuals().weak_text_color())
+                            }
+                            TlsProbeStatus::Skipped(reason) => {
+                                (format!("跳过({reason})"), ui.visuals().weak_text_color())
+                            }
+                            TlsProbeStatus::Failed(reason) => (
+                                format!("失败({reason})"),
+                                egui::Color32::from_rgb(190, 64, 64),
+                            ),
+                        };
+                        let response = ui.colored_label(tls_color, short_text(&tls_text, 24));
+                        response.on_hover_text(tls_text);
+                    });
+                    row.col(|ui| {
+                        let (udp_text, udp_color) = match &result.udp_status {
+                            UdpProbeStatus::Passed(message) => (
+                                result
+                                    .udp_latency_ms
+                                    .map(|latency| format!("通过({message}, {latency}ms)"))
+                                    .unwrap_or_else(|| format!("通过({message})")),
+                                egui::Color32::from_rgb(32, 145, 91),
+                            ),
+                            UdpProbeStatus::Partial(message) => (
+                                format!("部分({message})"),
+                                egui::Color32::from_rgb(194, 122, 0),
+                            ),
+                            UdpProbeStatus::Failed(message) => (
+                                format!("失败({message})"),
+                                egui::Color32::from_rgb(190, 64, 64),
+                            ),
+                            UdpProbeStatus::Skipped(message) => {
+                                (format!("跳过({message})"), ui.visuals().weak_text_color())
+                            }
+                        };
+                        let response = ui.colored_label(udp_color, short_text(&udp_text, 24));
+                        response.on_hover_text(udp_text);
+                    });
+                    row.col(|ui| {
+                        let (security_text, security_color) = match result.security.security_level {
+                            SecurityLevel::High => ("高", egui::Color32::from_rgb(32, 145, 91)),
+                            SecurityLevel::Medium => ("中", egui::Color32::from_rgb(194, 122, 0)),
+                            SecurityLevel::Low => ("低", egui::Color32::from_rgb(190, 64, 64)),
+                            SecurityLevel::Unknown => ("未知", ui.visuals().weak_text_color()),
+                        };
+                        ui.colored_label(security_color, security_text);
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{} / 100", result.security.score));
+                    });
+                    row.col(|ui| {
+                        let color = match result.status {
+                            NodeStatus::Pass => egui::Color32::from_rgb(32, 145, 91),
+                            NodeStatus::Warn => egui::Color32::from_rgb(194, 122, 0),
+                            NodeStatus::Fail => egui::Color32::from_rgb(190, 64, 64),
+                        };
+                        let full = format!("{} - {}", result.status.label(), result.message);
+                        let response = ui.label(RichText::new(short_text(&full, 50)).color(color));
+                        response.on_hover_text(full);
+                    });
+
+                    let row_response = row.response();
+                    if row_response.clicked() {
+                        self.selected_result_index = Some(result_index);
+                    }
+                    if row_response.double_clicked() {
+                        self.selected_result_index = Some(result_index);
+                        self.show_node_detail = true;
+                    }
+                });
+            });
+    }
+
+    fn table_ui_full(&mut self, ui: &mut egui::Ui, row_indices: &[usize]) {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -825,85 +998,164 @@ impl eframe::App for ClashCheckerApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Clash 订阅节点多项检测");
-            ui.add_space(8.0);
+        egui::SidePanel::left("left_control_panel")
+            .resizable(true)
+            .default_width(420.0)
+            .min_width(300.0)
+            .max_width(560.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.heading("Clash 订阅节点多项检测");
+                        ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
-                ui.label("订阅 URL");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.subscription_url)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("https://example.com/clash.yaml"),
-                );
+                        ui.label("订阅 URL");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.subscription_url)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("https://example.com/clash.yaml"),
+                        );
+                        ui.add_space(8.0);
+
+                        ui.label("检测参数");
+                        egui::Grid::new("control_grid")
+                            .num_columns(2)
+                            .spacing([10.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("超时");
+                                ui.add(
+                                    egui::Slider::new(&mut self.timeout_secs, 1.0..=20.0)
+                                        .suffix(" 秒")
+                                        .step_by(1.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("采样次数");
+                                ui.add(egui::Slider::new(&mut self.attempts, 1..=10).suffix(" 次"));
+                                ui.end_row();
+
+                                ui.label("并发");
+                                ui.add(
+                                    egui::Slider::new(&mut self.workers, 1..=128).suffix(" 线程"),
+                                );
+                                ui.end_row();
+                            });
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.checkbox(&mut self.enable_tls_probe, "TLS 握手检测");
+                            ui.label("稳定性窗口");
+                            ui.selectable_value(&mut self.stability_window_secs, 0, "关闭");
+                            ui.selectable_value(&mut self.stability_window_secs, 30, "30秒");
+                            ui.selectable_value(&mut self.stability_window_secs, 60, "60秒");
+                        });
+
+                        let button_text = if self.checking {
+                            "检测中..."
+                        } else {
+                            "开始检测"
+                        };
+                        if ui
+                            .add_sized([ui.available_width(), 32.0], egui::Button::new(button_text))
+                            .clicked()
+                            && !self.checking
+                        {
+                            self.start();
+                        }
+
+                        ui.add_space(8.0);
+                        ui.label(&self.status_line);
+                        ui.separator();
+
+                        ui.label("筛选与搜索");
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(&mut self.row_filter, RowFilter::All, "全部");
+                            ui.selectable_value(&mut self.row_filter, RowFilter::Pass, "通过");
+                            ui.selectable_value(&mut self.row_filter, RowFilter::Warn, "部分");
+                            ui.selectable_value(&mut self.row_filter, RowFilter::Fail, "失败");
+                            ui.selectable_value(
+                                &mut self.row_filter,
+                                RowFilter::HighRisk,
+                                "高风险",
+                            );
+                        });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.search_text)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("节点名 / 服务器 / 原因"),
+                        );
+
+                        ui.add_space(8.0);
+                        let filtered_count = self.filtered_result_indices().len();
+                        ui.label(format!(
+                            "当前显示：{} / {}",
+                            filtered_count,
+                            self.results.len()
+                        ));
+                        ui.horizontal_wrapped(|ui| {
+                            metric_chip(ui, "TCP可连", &self.tcp_alive_count().to_string());
+                            metric_chip(ui, "UDP通过", &self.udp_pass_count().to_string());
+                            metric_chip(ui, "TTFB通过", &self.ttfb_pass_count().to_string());
+                            metric_chip(ui, "严格通过", &self.pass_count().to_string());
+                            metric_chip(ui, "失败", &self.fail_count().to_string());
+                        });
+
+                        egui::CollapsingHeader::new("完整指标面板")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                self.summary_ui(ui);
+                            });
+
+                        if let Some(result) = self
+                            .selected_result_index
+                            .and_then(|index| self.results.get(index))
+                        {
+                            ui.add_space(10.0);
+                            egui::Frame::group(ui.style())
+                                .inner_margin(egui::Margin::same(10.0))
+                                .show(ui, |ui| {
+                                    ui.strong(format!("选中节点：{}", result.node.name));
+                                    ui.label(format!(
+                                        "端点：{}:{}  |  协议：{}",
+                                        result.node.server, result.node.port, result.node.node_type
+                                    ));
+                                    ui.label(format!(
+                                        "完整状态：{} - {}",
+                                        result.status.label(),
+                                        result.message
+                                    ));
+                                    if !result.security.note.is_empty() {
+                                        ui.label(format!("评估说明：{}", result.security.note));
+                                    }
+                                });
+                        }
+                    });
             });
 
-            ui.add_space(8.0);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let filtered_indices = self.filtered_result_indices();
 
             ui.horizontal_wrapped(|ui| {
-                ui.label("超时");
-                ui.add(
-                    egui::Slider::new(&mut self.timeout_secs, 1.0..=20.0)
-                        .suffix(" 秒")
-                        .step_by(1.0),
-                );
-
-                ui.label("采样次数");
-                ui.add(egui::Slider::new(&mut self.attempts, 1..=10).suffix(" 次"));
-
-                ui.label("并发");
-                ui.add(egui::Slider::new(&mut self.workers, 1..=128).suffix(" 线程"));
-
-                ui.checkbox(&mut self.enable_tls_probe, "TLS 握手检测");
-                ui.label("稳定性窗口");
-                ui.selectable_value(&mut self.stability_window_secs, 0, "关闭");
-                ui.selectable_value(&mut self.stability_window_secs, 30, "30秒");
-                ui.selectable_value(&mut self.stability_window_secs, 60, "60秒");
-
-                let button = egui::Button::new(if self.checking {
-                    "检测中..."
-                } else {
-                    "开始检测"
-                });
-
-                if ui.add_enabled(!self.checking, button).clicked() {
-                    self.start();
+                ui.heading("节点结果");
+                ui.separator();
+                ui.label(format!(
+                    "显示 {} / {}",
+                    filtered_indices.len(),
+                    self.results.len()
+                ));
+                ui.separator();
+                ui.label("表格模式");
+                ui.selectable_value(&mut self.table_mode, TableMode::Compact, "精简");
+                ui.selectable_value(&mut self.table_mode, TableMode::Full, "完整");
+                if ui.button("打开详情").clicked() && self.selected_result_index.is_some() {
+                    self.show_node_detail = true;
                 }
             });
-
-            ui.add_space(8.0);
-            ui.label(&self.status_line);
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label("结果筛选");
-                ui.selectable_value(&mut self.row_filter, RowFilter::All, "全部");
-                ui.selectable_value(&mut self.row_filter, RowFilter::Pass, "通过");
-                ui.selectable_value(&mut self.row_filter, RowFilter::Warn, "部分");
-                ui.selectable_value(&mut self.row_filter, RowFilter::Fail, "失败");
-                ui.selectable_value(&mut self.row_filter, RowFilter::HighRisk, "高风险");
-                ui.label("搜索");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search_text)
-                        .desired_width(260.0)
-                        .hint_text("节点名/服务器/原因"),
-                );
-            });
-            ui.add_space(12.0);
-
-            self.summary_ui(ui);
-            ui.add_space(12.0);
-
-            let filtered_indices = self.filtered_result_indices();
-            ui.label(format!(
-                "当前显示：{} / {}",
-                filtered_indices.len(),
-                self.results.len()
-            ));
-            ui.label("提示：单击行可选中，双击行打开节点详细信息。");
+            ui.label("提示：单击行选中，双击行打开节点详细信息。");
             ui.add_space(6.0);
 
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_height(360.0);
+                ui.set_min_height(ui.available_height().max(360.0));
                 if self.results.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.label("暂无检测结果");
@@ -913,38 +1165,18 @@ impl eframe::App for ClashCheckerApp {
                         ui.label("筛选后没有匹配结果");
                     });
                 } else {
-                    egui::ScrollArea::horizontal()
+                    let min_width = match self.table_mode {
+                        TableMode::Compact => 1850.0,
+                        TableMode::Full => 3650.0,
+                    };
+                    egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_min_width(3650.0);
+                            ui.set_min_width(min_width);
                             self.table_ui(ui, &filtered_indices);
                         });
                 }
             });
-
-            if let Some(result) = self
-                .selected_result_index
-                .and_then(|index| self.results.get(index))
-            {
-                ui.add_space(10.0);
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(10.0))
-                    .show(ui, |ui| {
-                        ui.strong(format!("选中节点：{}", result.node.name));
-                        ui.label(format!(
-                            "端点：{}:{}  |  协议：{}",
-                            result.node.server, result.node.port, result.node.node_type
-                        ));
-                        ui.label(format!(
-                            "完整状态：{} - {}",
-                            result.status.label(),
-                            result.message
-                        ));
-                        if !result.security.note.is_empty() {
-                            ui.label(format!("评估说明：{}", result.security.note));
-                        }
-                    });
-            }
         });
 
         if self.show_metric_guide {
@@ -1155,6 +1387,12 @@ enum RowFilter {
     HighRisk,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableMode {
+    Compact,
+    Full,
+}
+
 fn configure_chinese_font(ctx: &egui::Context) {
     let candidates = [
         r"C:\Windows\Fonts\simhei.ttf",
@@ -1190,6 +1428,17 @@ fn summary_tile(ui: &mut egui::Ui, label: &str, value: String) {
             ui.set_min_width(120.0);
             ui.label(label);
             ui.heading(value);
+        });
+}
+
+fn metric_chip(ui: &mut egui::Ui, label: &str, value: &str) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(label);
+                ui.strong(value);
+            });
         });
 }
 
