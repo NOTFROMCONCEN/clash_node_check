@@ -3,6 +3,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 use eframe::egui;
+use egui::RichText;
 use egui_extras::{Column, TableBuilder};
 
 use crate::checker::{
@@ -166,7 +167,7 @@ impl ClashCheckerApp {
     }
 
     fn summary_ui(&self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             summary_tile(ui, "总节点", self.results.len().to_string());
             summary_tile(
                 ui,
@@ -192,7 +193,7 @@ impl ClashCheckerApp {
 
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             summary_tile(
                 ui,
                 "DNS通过",
@@ -234,14 +235,14 @@ impl ClashCheckerApp {
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(220.0).at_least(140.0))
+            .column(Column::initial(280.0).at_least(180.0))
             .column(Column::initial(80.0).at_least(64.0))
-            .column(Column::initial(180.0).at_least(120.0))
+            .column(Column::initial(240.0).at_least(140.0))
             .column(Column::initial(80.0).at_least(60.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
-            .column(Column::initial(120.0).at_least(90.0))
-            .column(Column::remainder().at_least(220.0))
+            .column(Column::initial(360.0).at_least(220.0))
+            .column(Column::initial(620.0).at_least(340.0))
             .header(28.0, |mut header| {
                 header.col(|ui| {
                     ui.strong("节点");
@@ -314,7 +315,8 @@ impl ClashCheckerApp {
                                 egui::Color32::from_rgb(190, 64, 64),
                             ),
                         };
-                        ui.colored_label(tls_color, tls_text);
+                        let response = ui.colored_label(tls_color, short_text(&tls_text, 42));
+                        response.on_hover_text(tls_text);
                     });
                     row.col(|ui| {
                         let color = match result.status {
@@ -322,10 +324,9 @@ impl ClashCheckerApp {
                             NodeStatus::Warn => egui::Color32::from_rgb(194, 122, 0),
                             NodeStatus::Fail => egui::Color32::from_rgb(190, 64, 64),
                         };
-                        ui.colored_label(
-                            color,
-                            format!("{} - {}", result.status.label(), result.message),
-                        );
+                        let full = format!("{} - {}", result.status.label(), result.message);
+                        let response = ui.label(RichText::new(short_text(&full, 86)).color(color));
+                        response.on_hover_text(full);
                     });
                 });
             });
@@ -355,7 +356,7 @@ impl eframe::App for ClashCheckerApp {
 
             ui.add_space(8.0);
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("超时");
                 ui.add(
                     egui::Slider::new(&mut self.timeout_secs, 1.0..=20.0)
@@ -396,7 +397,12 @@ impl eframe::App for ClashCheckerApp {
                         ui.label("暂无检测结果");
                     });
                 } else {
-                    self.table_ui(ui);
+                    egui::ScrollArea::horizontal()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_min_width(1900.0);
+                            self.table_ui(ui);
+                        });
                 }
             });
         });
@@ -439,4 +445,20 @@ fn summary_tile(ui: &mut egui::Ui, label: &str, value: String) {
             ui.label(label);
             ui.heading(value);
         });
+}
+
+fn short_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_owned();
+    }
+
+    let mut output = String::with_capacity(max_chars + 1);
+    for (index, ch) in input.chars().enumerate() {
+        if index >= max_chars {
+            break;
+        }
+        output.push(ch);
+    }
+    output.push('…');
+    output
 }
