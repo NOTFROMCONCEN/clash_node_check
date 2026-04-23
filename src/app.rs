@@ -1242,137 +1242,200 @@ impl eframe::App for ClashCheckerApp {
                 .and_then(|index| self.results.get(index).cloned());
             egui::Window::new("节点详细信息")
                 .open(&mut self.show_node_detail)
+                .collapsible(false)
                 .resizable(true)
-                .default_width(860.0)
+                .default_size([980.0, 760.0])
+                .min_size([720.0, 520.0])
                 .show(ctx, |ui| {
                     let Some(result) = selected else {
                         ui.label("当前没有可查看的节点详情。");
                         return;
                     };
 
-                    ui.heading(&result.node.name);
-                    ui.add_space(8.0);
-
-                    egui::Grid::new("node_detail_grid")
-                        .num_columns(2)
-                        .striped(true)
-                        .spacing([12.0, 8.0])
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            detail_row(ui, "协议", &result.node.node_type);
-                            detail_row(ui, "服务器", &result.node.server);
-                            detail_row(ui, "端口", &result.node.port.to_string());
-                            detail_row(
-                                ui,
-                                "TCP成功",
-                                &format!("{}/{}", result.tcp_successes, result.tcp_attempts),
-                            );
-                            detail_row(
-                                ui,
-                                "TCP均延迟",
-                                &result
-                                    .tcp_avg_latency_ms
-                                    .map(|value| format!("{value} ms"))
-                                    .unwrap_or_else(|| "-".to_owned()),
-                            );
-                            detail_row(
-                                ui,
-                                "TCP抖动",
-                                &result
-                                    .tcp_jitter_ms
-                                    .map(|value| format!("{value} ms"))
-                                    .unwrap_or_else(|| "-".to_owned()),
-                            );
-                            detail_row(ui, "TCP丢包", &format!("{:.1}%", result.tcp_loss_percent));
-                            detail_row(
-                                ui,
-                                "TLS结果",
-                                &match &result.tls_status {
-                                    TlsProbeStatus::Passed => result
-                                        .tls_latency_ms
-                                        .map(|latency| format!("通过 ({latency} ms)"))
-                                        .unwrap_or_else(|| "通过".to_owned()),
-                                    TlsProbeStatus::Disabled => "关闭".to_owned(),
-                                    TlsProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
-                                    TlsProbeStatus::Failed(reason) => format!("失败 ({reason})"),
-                                },
-                            );
-                            detail_row(
-                                ui,
-                                "UDP结果",
-                                &match &result.udp_status {
-                                    UdpProbeStatus::Passed(reason) => result
-                                        .udp_latency_ms
-                                        .map(|latency| format!("通过 ({reason}, {latency} ms)"))
-                                        .unwrap_or_else(|| format!("通过 ({reason})")),
-                                    UdpProbeStatus::Partial(reason) => format!("部分 ({reason})"),
-                                    UdpProbeStatus::Failed(reason) => format!("失败 ({reason})"),
-                                    UdpProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
-                                },
-                            );
-                            detail_row(
-                                ui,
-                                "TTFB结果",
-                                &match &result.ttfb_status {
-                                    TtfbProbeStatus::Passed(reason) => result
-                                        .ttfb_ms
-                                        .map(|latency| format!("通过 ({reason}, {latency} ms)"))
-                                        .unwrap_or_else(|| format!("通过 ({reason})")),
-                                    TtfbProbeStatus::Failed(reason) => format!("失败 ({reason})"),
-                                    TtfbProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
-                                },
-                            );
-                            detail_row(
-                                ui,
-                                "稳定性",
-                                &if result.stability.level == StabilityLevel::Disabled {
-                                    "关闭".to_owned()
-                                } else {
-                                    format!(
-                                        "{}（窗口 {} 秒，超时率 {:.1}%，最大连续失败 {}）",
-                                        result.stability.level.label(),
-                                        result.stability.window_secs,
-                                        result.stability.timeout_rate_percent,
-                                        result.stability.max_consecutive_failures
-                                    )
-                                },
-                            );
-                            detail_row(ui, "协议探测", &result.protocol_probe.short_label());
-                            detail_row(ui, "安全等级", result.security.security_level.label());
-                            detail_row(ui, "加密等级", result.security.encryption_level.label());
-                            detail_row(ui, "安全评分", &format!("{} / 100", result.security.score));
-                            detail_row(ui, "TLS配置", &option_bool_text(result.node.tls));
-                            detail_row(
-                                ui,
-                                "跳过证书校验",
-                                &option_bool_text(result.node.skip_cert_verify),
-                            );
-                            detail_row(ui, "Cipher", &option_text(result.node.cipher.as_deref()));
-                            detail_row(
-                                ui,
-                                "Security",
-                                &option_text(result.node.security.as_deref()),
-                            );
-                            detail_row(ui, "Flow", &option_text(result.node.flow.as_deref()));
-                            detail_row(ui, "ALPN", &option_text(result.node.alpn.as_deref()));
-                            detail_row(ui, "Network", &option_text(result.node.network.as_deref()));
-                            detail_row(
-                                ui,
-                                "ServerName/SNI",
-                                &option_text(result.node.server_name.as_deref()),
-                            );
-                            detail_row(ui, "最终状态", result.status.label());
-                        });
+                            ui.heading(&result.node.name);
+                            ui.add_space(8.0);
 
-                    ui.add_space(8.0);
-                    ui.label("评估说明");
-                    ui.separator();
-                    ui.label(if result.security.note.is_empty() {
-                        "无额外说明".to_owned()
-                    } else {
-                        result.security.note
-                    });
-                    ui.add_space(8.0);
-                    ui.label(format!("检测摘要：{}", result.message));
+                            egui::Grid::new("node_detail_grid")
+                                .num_columns(2)
+                                .striped(true)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    detail_row(ui, "协议", &result.node.node_type);
+                                    detail_row(ui, "服务器", &result.node.server);
+                                    detail_row(ui, "端口", &result.node.port.to_string());
+                                    detail_row(
+                                        ui,
+                                        "TCP成功",
+                                        &format!(
+                                            "{}/{}",
+                                            result.tcp_successes, result.tcp_attempts
+                                        ),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "TCP均延迟",
+                                        &result
+                                            .tcp_avg_latency_ms
+                                            .map(|value| format!("{value} ms"))
+                                            .unwrap_or_else(|| "-".to_owned()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "TCP抖动",
+                                        &result
+                                            .tcp_jitter_ms
+                                            .map(|value| format!("{value} ms"))
+                                            .unwrap_or_else(|| "-".to_owned()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "TCP丢包",
+                                        &format!("{:.1}%", result.tcp_loss_percent),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "TLS结果",
+                                        &match &result.tls_status {
+                                            TlsProbeStatus::Passed => result
+                                                .tls_latency_ms
+                                                .map(|latency| format!("通过 ({latency} ms)"))
+                                                .unwrap_or_else(|| "通过".to_owned()),
+                                            TlsProbeStatus::Disabled => "关闭".to_owned(),
+                                            TlsProbeStatus::Skipped(reason) => {
+                                                format!("跳过 ({reason})")
+                                            }
+                                            TlsProbeStatus::Failed(reason) => {
+                                                format!("失败 ({reason})")
+                                            }
+                                        },
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "UDP结果",
+                                        &match &result.udp_status {
+                                            UdpProbeStatus::Passed(reason) => result
+                                                .udp_latency_ms
+                                                .map(|latency| {
+                                                    format!("通过 ({reason}, {latency} ms)")
+                                                })
+                                                .unwrap_or_else(|| format!("通过 ({reason})")),
+                                            UdpProbeStatus::Partial(reason) => {
+                                                format!("部分 ({reason})")
+                                            }
+                                            UdpProbeStatus::Failed(reason) => {
+                                                format!("失败 ({reason})")
+                                            }
+                                            UdpProbeStatus::Skipped(reason) => {
+                                                format!("跳过 ({reason})")
+                                            }
+                                        },
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "TTFB结果",
+                                        &match &result.ttfb_status {
+                                            TtfbProbeStatus::Passed(reason) => result
+                                                .ttfb_ms
+                                                .map(|latency| {
+                                                    format!("通过 ({reason}, {latency} ms)")
+                                                })
+                                                .unwrap_or_else(|| format!("通过 ({reason})")),
+                                            TtfbProbeStatus::Failed(reason) => {
+                                                format!("失败 ({reason})")
+                                            }
+                                            TtfbProbeStatus::Skipped(reason) => {
+                                                format!("跳过 ({reason})")
+                                            }
+                                        },
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "稳定性",
+                                        &if result.stability.level == StabilityLevel::Disabled {
+                                            "关闭".to_owned()
+                                        } else {
+                                            format!(
+                                                "{}（窗口 {} 秒，超时率 {:.1}%，最大连续失败 {}）",
+                                                result.stability.level.label(),
+                                                result.stability.window_secs,
+                                                result.stability.timeout_rate_percent,
+                                                result.stability.max_consecutive_failures
+                                            )
+                                        },
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "协议探测",
+                                        &result.protocol_probe.short_label(),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "安全等级",
+                                        result.security.security_level.label(),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "加密等级",
+                                        result.security.encryption_level.label(),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "安全评分",
+                                        &format!("{} / 100", result.security.score),
+                                    );
+                                    detail_row(ui, "TLS配置", &option_bool_text(result.node.tls));
+                                    detail_row(
+                                        ui,
+                                        "跳过证书校验",
+                                        &option_bool_text(result.node.skip_cert_verify),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "Cipher",
+                                        &option_text(result.node.cipher.as_deref()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "Security",
+                                        &option_text(result.node.security.as_deref()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "Flow",
+                                        &option_text(result.node.flow.as_deref()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "ALPN",
+                                        &option_text(result.node.alpn.as_deref()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "Network",
+                                        &option_text(result.node.network.as_deref()),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "ServerName/SNI",
+                                        &option_text(result.node.server_name.as_deref()),
+                                    );
+                                    detail_row(ui, "最终状态", result.status.label());
+                                });
+
+                            ui.add_space(8.0);
+                            ui.label("评估说明");
+                            ui.separator();
+                            ui.label(if result.security.note.is_empty() {
+                                "无额外说明".to_owned()
+                            } else {
+                                result.security.note
+                            });
+                            ui.add_space(8.0);
+                            ui.label(format!("检测摘要：{}", result.message));
+                        });
                 });
         }
     }
@@ -1444,7 +1507,7 @@ fn metric_chip(ui: &mut egui::Ui, label: &str, value: &str) {
 
 fn detail_row(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.strong(key);
-    ui.label(value);
+    ui.add(egui::Label::new(value).wrap());
     ui.end_row();
 }
 
