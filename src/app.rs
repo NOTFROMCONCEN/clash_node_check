@@ -7,8 +7,8 @@ use egui::RichText;
 use egui_extras::{Column, TableBuilder};
 
 use crate::checker::{
-    start_check, CheckEvent, CheckOptions, NodeCheckResult, NodeStatus, StartSummary,
-    TlsProbeStatus,
+    start_check, CheckEvent, CheckOptions, EncryptionLevel, NodeCheckResult, NodeStatus,
+    SecurityLevel, StartSummary, TlsProbeStatus,
 };
 
 pub struct ClashCheckerApp {
@@ -160,6 +160,53 @@ impl ClashCheckerApp {
             .count()
     }
 
+    fn high_security_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.security.security_level == SecurityLevel::High)
+            .count()
+    }
+
+    fn medium_security_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.security.security_level == SecurityLevel::Medium)
+            .count()
+    }
+
+    fn low_security_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.security.security_level == SecurityLevel::Low)
+            .count()
+    }
+
+    fn strong_encryption_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.security.encryption_level == EncryptionLevel::Strong)
+            .count()
+    }
+
+    fn moderate_encryption_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.security.encryption_level == EncryptionLevel::Moderate)
+            .count()
+    }
+
+    fn weak_or_plaintext_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result.security.encryption_level,
+                    EncryptionLevel::Weak | EncryptionLevel::Plaintext
+                )
+            })
+            .count()
+    }
+
     fn percent(&self, count: usize) -> f32 {
         if self.results.is_empty() {
             0.0
@@ -230,6 +277,65 @@ impl ClashCheckerApp {
                 self.start_summary.tls_target_count.to_string(),
             );
         });
+
+        ui.add_space(8.0);
+
+        ui.horizontal_wrapped(|ui| {
+            summary_tile(
+                ui,
+                "高安全",
+                format!(
+                    "{} ({:.1}%)",
+                    self.high_security_count(),
+                    self.percent(self.high_security_count())
+                ),
+            );
+            summary_tile(
+                ui,
+                "中安全",
+                format!(
+                    "{} ({:.1}%)",
+                    self.medium_security_count(),
+                    self.percent(self.medium_security_count())
+                ),
+            );
+            summary_tile(
+                ui,
+                "低安全",
+                format!(
+                    "{} ({:.1}%)",
+                    self.low_security_count(),
+                    self.percent(self.low_security_count())
+                ),
+            );
+            summary_tile(
+                ui,
+                "强加密",
+                format!(
+                    "{} ({:.1}%)",
+                    self.strong_encryption_count(),
+                    self.percent(self.strong_encryption_count())
+                ),
+            );
+            summary_tile(
+                ui,
+                "中加密",
+                format!(
+                    "{} ({:.1}%)",
+                    self.moderate_encryption_count(),
+                    self.percent(self.moderate_encryption_count())
+                ),
+            );
+            summary_tile(
+                ui,
+                "弱/明文",
+                format!(
+                    "{} ({:.1}%)",
+                    self.weak_or_plaintext_count(),
+                    self.percent(self.weak_or_plaintext_count())
+                ),
+            );
+        });
     }
 
     fn table_ui(&self, ui: &mut egui::Ui) {
@@ -244,6 +350,9 @@ impl ClashCheckerApp {
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(360.0).at_least(220.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(620.0).at_least(340.0))
             .header(28.0, |mut header| {
                 header.col(|ui| {
@@ -266,6 +375,15 @@ impl ClashCheckerApp {
                 });
                 header.col(|ui| {
                     ui.strong("TLS");
+                });
+                header.col(|ui| {
+                    ui.strong("安全");
+                });
+                header.col(|ui| {
+                    ui.strong("加密");
+                });
+                header.col(|ui| {
+                    ui.strong("评分");
                 });
                 header.col(|ui| {
                     ui.strong("状态");
@@ -319,6 +437,45 @@ impl ClashCheckerApp {
                         };
                         let response = ui.colored_label(tls_color, short_text(&tls_text, 42));
                         response.on_hover_text(tls_text);
+                    });
+                    row.col(|ui| {
+                        let (security_text, security_color) = match result.security.security_level {
+                            SecurityLevel::High => ("高", egui::Color32::from_rgb(32, 145, 91)),
+                            SecurityLevel::Medium => ("中", egui::Color32::from_rgb(194, 122, 0)),
+                            SecurityLevel::Low => ("低", egui::Color32::from_rgb(190, 64, 64)),
+                            SecurityLevel::Unknown => ("未知", ui.visuals().weak_text_color()),
+                        };
+                        let response = ui.colored_label(security_color, security_text);
+                        response.on_hover_text(if result.security.note.is_empty() {
+                            format!("安全等级: {}", result.security.security_level.label())
+                        } else {
+                            format!(
+                                "安全等级: {}\n{}",
+                                result.security.security_level.label(),
+                                result.security.note
+                            )
+                        });
+                    });
+                    row.col(|ui| {
+                        let (enc_text, enc_color) = match result.security.encryption_level {
+                            EncryptionLevel::Strong => ("强", egui::Color32::from_rgb(32, 145, 91)),
+                            EncryptionLevel::Moderate => {
+                                ("中", egui::Color32::from_rgb(194, 122, 0))
+                            }
+                            EncryptionLevel::Weak => ("弱", egui::Color32::from_rgb(190, 64, 64)),
+                            EncryptionLevel::Plaintext => {
+                                ("明文", egui::Color32::from_rgb(190, 64, 64))
+                            }
+                            EncryptionLevel::Unknown => ("未知", ui.visuals().weak_text_color()),
+                        };
+                        let response = ui.colored_label(enc_color, enc_text);
+                        response.on_hover_text(format!(
+                            "加密等级: {}",
+                            result.security.encryption_level.label()
+                        ));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{} / 100", result.security.score));
                     });
                     row.col(|ui| {
                         let color = match result.status {
@@ -417,7 +574,7 @@ impl eframe::App for ClashCheckerApp {
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_min_width(1900.0);
+                            ui.set_min_width(2400.0);
                             self.table_ui(ui);
                         });
                 }
@@ -444,6 +601,9 @@ impl eframe::App for ClashCheckerApp {
                     ui.label("TCP均延迟：TCP 成功采样的平均耗时。");
                     ui.label("TCP成功：采样成功次数 / 采样总次数。");
                     ui.label("TLS：对 TLS 类协议执行 ClientHello 预检的结果。");
+                    ui.label("安全：综合协议、TLS、证书校验、稳定性得出的安全等级。");
+                    ui.label("加密：根据协议和可见配置推断的加密强度。");
+                    ui.label("评分：0~100 的综合安全分，越高越好。");
                     ui.label("状态：将 DNS/TCP/TLS 汇总后的最终判定与简要原因。");
                     ui.add_space(8.0);
 

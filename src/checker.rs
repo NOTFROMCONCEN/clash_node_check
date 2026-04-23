@@ -62,6 +62,54 @@ impl NodeStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecurityLevel {
+    High,
+    Medium,
+    Low,
+    Unknown,
+}
+
+impl SecurityLevel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::High => "高",
+            Self::Medium => "中",
+            Self::Low => "低",
+            Self::Unknown => "未知",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncryptionLevel {
+    Strong,
+    Moderate,
+    Weak,
+    Plaintext,
+    Unknown,
+}
+
+impl EncryptionLevel {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Strong => "强",
+            Self::Moderate => "中",
+            Self::Weak => "弱",
+            Self::Plaintext => "明文",
+            Self::Unknown => "未知",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SecurityAssessment {
+    pub security_level: SecurityLevel,
+    pub encryption_level: EncryptionLevel,
+    pub score: u8,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TlsProbeStatus {
     Disabled,
     Skipped(String),
@@ -94,6 +142,7 @@ pub struct NodeCheckResult {
     pub tcp_avg_latency_ms: Option<u128>,
     pub tls_status: TlsProbeStatus,
     pub tls_latency_ms: Option<u128>,
+    pub security: SecurityAssessment,
     pub message: String,
 }
 
@@ -232,6 +281,12 @@ fn dns_failed(node: ProxyNode, reason: String, attempts: u8) -> NodeCheckResult 
         tcp_avg_latency_ms: None,
         tls_status: TlsProbeStatus::Skipped("DNS失败".to_owned()),
         tls_latency_ms: None,
+        security: SecurityAssessment {
+            security_level: SecurityLevel::Unknown,
+            encryption_level: EncryptionLevel::Unknown,
+            score: 0,
+            note: "无法评估：DNS失败".to_owned(),
+        },
         message: reason,
     }
 }
@@ -425,6 +480,7 @@ fn build_result(
         &tls_probe.status,
         tcp_probe.last_error.as_deref(),
     );
+    let security = assess_security(&node, &tls_probe.status, tcp_probe.successes, attempts);
 
     NodeCheckResult {
         node,
@@ -435,6 +491,7 @@ fn build_result(
         tcp_avg_latency_ms,
         tls_status: tls_probe.status,
         tls_latency_ms: tls_probe.latency_ms,
+        security,
         message,
     }
 }
@@ -472,4 +529,195 @@ fn average(values: &[u128]) -> Option<u128> {
     } else {
         Some(values.iter().sum::<u128>() / values.len() as u128)
     }
+}
+
+fn assess_security(
+    node: &ProxyNode,
+    tls_status: &TlsProbeStatus,
+    tcp_successes: usize,
+    attempts: u8,
+) -> SecurityAssessment {
+    let protocol = node.node_type.to_ascii_lowercase();
+    let mut notes = Vec::new();
+
+    let (encryption_level, encryption_score) =
+        encryption_strength(node, tls_status, &protocol, &mut notes);
+    let transport_score = protocol_security_score(&protocol);
+    let tls_score = tls_security_score(tls_status, &protocol, &mut notes);
+    let cert_score = cert_validation_score(node.skip_cert_verify, &mut notes);
+    let metadata_score = metadata_security_score(node, &protocol, &mut notes);
+    let reliability_score = if attempts == 0 {
+        0
+    } else {
+        ((tcp_successes as f32 / attempts as f32) * 10.0).round() as u8
+    };
+
+    let mut score = encryption_score
+        .saturating_add(transport_score)
+        .saturating_add(tls_score)
+        .saturating_add(cert_score)
+        .saturating_add(metadata_score)
+        .saturating_add(reliability_score);
+    if score > 100 {
+        score = 100;
+    }
+
+    let security_level = if protocol == "unknown" {
+        SecurityLevel::Unknown
+    } else if score >= 80 {
+        SecurityLevel::High
+    } else if score >= 55 {
+        SecurityLevel::Medium
+    } else {
+        SecurityLevel::Low
+    };
+
+    SecurityAssessment {
+        security_level,
+        encryption_level,
+        score,
+        note: notes.join("；"),
+    }
+}
+
+fn encryption_strength(
+    node: &ProxyNode,
+    tls_status: &TlsProbeStatus,
+    protocol: &str,
+    notes: &mut Vec<String>,
+) -> (EncryptionLevel, u8) {
+    if protocol == "http" {
+        notes.push("HTTP 为明文传输".to_owned());
+        return (EncryptionLevel::Plaintext, 0);
+    }
+
+    if protocol == "ss" {
+        if let Some(cipher) = node.cipher.as_deref() {
+            let cipher_l = cipher.to_ascii_lowercase();
+            if is_strong_cipher(&cipher_l) {
+                return (EncryptionLevel::Strong, 40);
+            }
+            if is_weak_cipher(&cipher_l) {
+                notes.push(format!("SS 使用弱加密算法 {cipher}"));
+                return (EncryptionLevel::Weak, 12);
+            }
+            notes.push(format!("SS 使用中等强度算法 {cipher}"));
+            return (EncryptionLevel::Moderate, 26);
+        }
+
+        notes.push("SS 未提供 cipher 信息".to_owned());
+        return (EncryptionLevel::Unknown, 18);
+    }
+
+    if matches!(
+        protocol,
+        "trojan" | "https" | "tuic" | "hysteria" | "hysteria2"
+    ) {
+        return (EncryptionLevel::Strong, 40);
+    }
+
+    if matches!(protocol, "vmess" | "vless") {
+        if node.tls == Some(true) || tls_status.is_passed() {
+            return (EncryptionLevel::Strong, 35);
+        }
+        notes.push("VMess/VLESS 未确认 TLS/REALITY".to_owned());
+        return (EncryptionLevel::Moderate, 24);
+    }
+
+    if matches!(protocol, "socks" | "socks5") {
+        notes.push("SOCKS5 默认不加密，依赖外层隧道".to_owned());
+        return (EncryptionLevel::Weak, 10);
+    }
+
+    (EncryptionLevel::Unknown, 16)
+}
+
+fn protocol_security_score(protocol: &str) -> u8 {
+    match protocol {
+        "trojan" | "tuic" | "hysteria" | "hysteria2" | "https" => 20,
+        "vless" | "vmess" => 16,
+        "ss" => 12,
+        "socks" | "socks5" => 6,
+        "http" => 0,
+        _ => 8,
+    }
+}
+
+fn tls_security_score(tls_status: &TlsProbeStatus, protocol: &str, notes: &mut Vec<String>) -> u8 {
+    match tls_status {
+        TlsProbeStatus::Passed => 20,
+        TlsProbeStatus::Failed(reason) => {
+            if should_probe_tls(protocol) {
+                notes.push(format!("TLS 预检失败：{reason}"));
+            }
+            2
+        }
+        TlsProbeStatus::Disabled => {
+            if should_probe_tls(protocol) {
+                notes.push("TLS 检测被关闭".to_owned());
+            }
+            8
+        }
+        TlsProbeStatus::Skipped(reason) => {
+            if should_probe_tls(protocol) {
+                notes.push(format!("TLS 跳过：{reason}"));
+                8
+            } else {
+                12
+            }
+        }
+    }
+}
+
+fn cert_validation_score(skip_cert_verify: Option<bool>, notes: &mut Vec<String>) -> u8 {
+    match skip_cert_verify {
+        Some(true) => {
+            notes.push("已配置跳过证书校验".to_owned());
+            0
+        }
+        Some(false) => 10,
+        None => {
+            notes.push("证书校验策略未知".to_owned());
+            6
+        }
+    }
+}
+
+fn metadata_security_score(node: &ProxyNode, protocol: &str, notes: &mut Vec<String>) -> u8 {
+    let mut score = 0_u8;
+
+    if let Some(network) = node.network.as_deref() {
+        let network_l = network.to_ascii_lowercase();
+        if matches!(network_l.as_str(), "grpc" | "ws" | "h2" | "http") {
+            notes.push(format!("传输层: {network}"));
+            score = score.saturating_add(2);
+        }
+    }
+
+    if should_probe_tls(protocol) {
+        if node.server_name.is_some() {
+            score = score.saturating_add(3);
+        } else {
+            notes.push("TLS 类节点未发现 SNI/ServerName".to_owned());
+        }
+    }
+
+    score
+}
+
+fn is_strong_cipher(cipher: &str) -> bool {
+    let strong = [
+        "aes-256-gcm",
+        "aes-128-gcm",
+        "chacha20-ietf-poly1305",
+        "xchacha20-ietf-poly1305",
+        "2022-blake3-aes-256-gcm",
+        "2022-blake3-chacha20-poly1305",
+    ];
+    strong.iter().any(|item| cipher.contains(item))
+}
+
+fn is_weak_cipher(cipher: &str) -> bool {
+    let weak = ["rc4", "des", "none", "md5", "bf-cfb"];
+    weak.iter().any(|item| cipher.contains(item))
 }

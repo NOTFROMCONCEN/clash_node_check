@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use base64::prelude::*;
 use serde::Deserialize;
 
@@ -7,6 +9,11 @@ pub struct ProxyNode {
     pub node_type: String,
     pub server: String,
     pub port: u16,
+    pub tls: Option<bool>,
+    pub skip_cert_verify: Option<bool>,
+    pub cipher: Option<String>,
+    pub network: Option<String>,
+    pub server_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -21,6 +28,13 @@ struct ClashProxy {
     node_type: Option<String>,
     server: Option<String>,
     port: Option<PortValue>,
+    tls: Option<BoolValue>,
+    #[serde(rename = "skip-cert-verify")]
+    skip_cert_verify: Option<BoolValue>,
+    cipher: Option<String>,
+    network: Option<String>,
+    sni: Option<String>,
+    servername: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +49,22 @@ impl PortValue {
         match self {
             Self::Number(port) => Some(*port),
             Self::Text(port) => port.parse().ok(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BoolValue {
+    Bool(bool),
+    Text(String),
+}
+
+impl BoolValue {
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            Self::Text(value) => parse_bool_text(value),
         }
     }
 }
@@ -74,6 +104,11 @@ fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>, serde_yaml::Error> 
                 node_type: proxy.node_type.unwrap_or_else(|| "unknown".to_owned()),
                 server,
                 port,
+                tls: proxy.tls.and_then(|value| value.as_bool()),
+                skip_cert_verify: proxy.skip_cert_verify.and_then(|value| value.as_bool()),
+                cipher: proxy.cipher,
+                network: proxy.network,
+                server_name: proxy.sni.or(proxy.servername),
             })
         })
         .collect();
@@ -100,11 +135,13 @@ fn parse_proxy_uri_line(line: &str) -> Option<ProxyNode> {
     let trimmed = line.trim();
     let (scheme, rest) = trimmed.split_once("://")?;
     let without_fragment = rest.split('#').next().unwrap_or(rest);
+    let query_part = without_fragment.split_once('?').map(|(_, query)| query);
     let host_port_part = without_fragment
         .rsplit('@')
         .next()
         .unwrap_or(without_fragment);
     let host_port_part = host_port_part.split('?').next().unwrap_or(host_port_part);
+    let query_map = parse_query_map(query_part.unwrap_or_default());
 
     let (server, port) = parse_host_port(host_port_part)?;
     let name = trimmed
@@ -119,6 +156,11 @@ fn parse_proxy_uri_line(line: &str) -> Option<ProxyNode> {
         node_type: scheme.to_owned(),
         server,
         port,
+        tls: infer_tls_from_uri(scheme, &query_map),
+        skip_cert_verify: infer_skip_cert_verify(&query_map),
+        cipher: infer_cipher(&query_map),
+        network: infer_network(&query_map),
+        server_name: infer_server_name(&query_map),
     })
 }
 
@@ -154,6 +196,101 @@ fn percent_decode_minimal(input: &str) -> Result<String, String> {
     }
 
     String::from_utf8(output).map_err(|error| error.to_string())
+}
+
+fn parse_query_map(query: &str) -> HashMap<String, String> {
+    let mut query_map = HashMap::new();
+
+    for part in query.split('&') {
+        if part.is_empty() {
+            continue;
+        }
+
+        let (raw_key, raw_value) = part.split_once('=').unwrap_or((part, ""));
+        let key = percent_decode_minimal(raw_key).unwrap_or_else(|_| raw_key.to_owned());
+        let value = percent_decode_minimal(raw_value).unwrap_or_else(|_| raw_value.to_owned());
+        if !key.is_empty() {
+            query_map.insert(key.to_ascii_lowercase(), value);
+        }
+    }
+
+    query_map
+}
+
+fn infer_tls_from_uri(scheme: &str, query_map: &HashMap<String, String>) -> Option<bool> {
+    if let Some(value) = query_map.get("security") {
+        let lower = value.to_ascii_lowercase();
+        if matches!(lower.as_str(), "tls" | "xtls" | "reality") {
+            return Some(true);
+        }
+        if matches!(lower.as_str(), "none" | "plain") {
+            return Some(false);
+        }
+    }
+
+    if let Some(value) = query_map
+        .get("tls")
+        .and_then(|value| parse_bool_text(value))
+    {
+        return Some(value);
+    }
+
+    if matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "trojan" | "https" | "tuic" | "hysteria" | "hysteria2"
+    ) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn infer_skip_cert_verify(query_map: &HashMap<String, String>) -> Option<bool> {
+    let candidates = ["skip-cert-verify", "allowinsecure", "insecure"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).and_then(|value| parse_bool_text(value)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn infer_cipher(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["cipher", "encryption", "method"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_network(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["type", "network"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_server_name(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["sni", "peer", "host"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn parse_bool_text(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
