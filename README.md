@@ -74,6 +74,21 @@ cargo test
 - `publish-github-release.ps1`：设置/校验 `origin`，切到 `main`，提交当前改动，创建 `v<version>` tag，推送到 GitHub，并通过 `gh release create` 上传发行资产。
 - 发布前需要本机已经安装并登录 GitHub CLI：`gh auth status`
 
+## GitHub Actions 自动发版
+
+- 已内置工作流：[.github/workflows/release.yml](.github/workflows/release.yml)
+- 触发方式：
+  - 推送 tag（`v*`）时：自动在 `windows-latest` 执行测试+打包，并发布 GitHub Release 资产。
+  - 手动触发 `workflow_dispatch` 时：执行打包并上传 workflow artifacts（不自动发 Release）。
+- 版本一致性校验：工作流会检查 `Cargo.toml` 版本是否与 tag 一致，例如 `version = "1.0.3"` 对应 tag `v1.0.3`。
+
+示例：
+
+```powershell
+git tag v1.0.4
+git push origin v1.0.4
+```
+
 ## 当前版本边界
 
 - 协议真实握手尚未补齐 vmess AEAD、tuic、hysteria / hysteria2、REALITY 细化路径。

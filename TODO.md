@@ -73,6 +73,8 @@
   - 验收：执行脚本后生成 release exe、zip 和校验文件。
 - [x] 20. GitHub 推送与 Release 发布脚本
   - 验收：通过本地脚本完成脱敏预检、commit、tag、push 和 `gh release create` 上传。
+- [x] 21. GitHub Actions Tag 自动发版（Windows）
+  - 验收：推送 `v*` tag 后自动执行 Windows 构建并上传 `.exe` / `.zip` / `sha256` 到 GitHub Release。
 
 ## 交付节奏
 
