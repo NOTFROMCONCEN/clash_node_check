@@ -6,6 +6,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, Error as RustlsError, SignatureScheme,
+    StreamOwned,
+};
+
 use crate::subscription::{parse_subscription, ProxyNode};
 
 #[derive(Clone, Debug)]
@@ -372,6 +379,7 @@ fn check_node(
         ),
         EndpointProbeResult::Probed {
             resolved_ip_count,
+            socket_addrs,
             tcp_probe,
             tls_probe,
             udp_probe,
@@ -380,11 +388,13 @@ fn check_node(
         } => build_result(
             node,
             resolved_ip_count,
+            &socket_addrs,
             tcp_probe,
             tls_probe,
             udp_probe,
             ttfb_probe,
             stability,
+            options.timeout,
             options.attempts.max(1),
         ),
     }
@@ -404,6 +414,7 @@ enum EndpointProbeResult {
     DnsFailed(String),
     Probed {
         resolved_ip_count: usize,
+        socket_addrs: Vec<SocketAddr>,
         tcp_probe: TcpProbe,
         tls_probe: TlsProbeStatusWithLatency,
         udp_probe: UdpProbeStatusWithLatency,
@@ -440,6 +451,7 @@ fn collect_endpoint_probe(node: &ProxyNode, options: &CheckOptions) -> EndpointP
 
     EndpointProbeResult::Probed {
         resolved_ip_count,
+        socket_addrs,
         tcp_probe,
         tls_probe,
         udp_probe,
@@ -955,19 +967,27 @@ fn classify_stability_level(
 fn build_result(
     node: ProxyNode,
     resolved_ip_count: usize,
+    socket_addrs: &[SocketAddr],
     tcp_probe: TcpProbe,
     tls_probe: TlsProbeStatusWithLatency,
     udp_probe: UdpProbeStatusWithLatency,
     ttfb_probe: TtfbProbeStatusWithLatency,
     stability: StabilityMetrics,
+    timeout: Duration,
     attempts: u8,
 ) -> NodeCheckResult {
     let tcp_avg_latency_ms = average(&tcp_probe.latencies_ms);
     let tcp_jitter_ms = jitter(&tcp_probe.latencies_ms);
     let tcp_loss_percent = loss_percent(tcp_probe.successes, attempts as usize);
     let tcp_ok = tcp_probe.successes > 0;
-    let protocol_probe =
-        run_protocol_probe(&node, &tls_probe.status, tcp_probe.successes, attempts);
+    let protocol_probe = run_protocol_probe(
+        &node,
+        socket_addrs,
+        timeout,
+        &tls_probe.status,
+        tcp_probe.successes,
+        attempts,
+    );
     let protocol_name = node.node_type.to_ascii_lowercase();
     let udp_is_required = is_udp_required_protocol(&protocol_name);
     let protocol_failed = protocol_probe.is_failed();
@@ -1085,8 +1105,431 @@ fn compose_message(
     parts.join(" | ")
 }
 
+#[derive(Debug)]
+struct InsecureTlsVerifier;
+
+impl ServerCertVerifier for InsecureTlsVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
+
+fn tls_connect(
+    node: &ProxyNode,
+    socket_addr: &SocketAddr,
+    timeout: Duration,
+) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
+    let mut tcp_stream =
+        TcpStream::connect_timeout(socket_addr, timeout).map_err(|error| error.to_string())?;
+    let _ = tcp_stream.set_read_timeout(Some(timeout));
+    let _ = tcp_stream.set_write_timeout(Some(timeout));
+
+    let server_name = resolve_server_name(node).map_err(|error| error.to_string())?;
+    let tls_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(InsecureTlsVerifier))
+        .with_no_client_auth();
+    let mut connection = ClientConnection::new(Arc::new(tls_config), server_name)
+        .map_err(|error| error.to_string())?;
+
+    while connection.is_handshaking() {
+        connection
+            .complete_io(&mut tcp_stream)
+            .map_err(|error| format!("TLS握手失败: {error}"))?;
+    }
+
+    Ok(StreamOwned::new(connection, tcp_stream))
+}
+
+fn resolve_server_name(node: &ProxyNode) -> Result<ServerName<'static>, &'static str> {
+    if let Some(server_name) = node.server_name.as_deref() {
+        return ServerName::try_from(server_name.to_owned()).map_err(|_| "无效的 SNI/ServerName");
+    }
+
+    if let Ok(ip) = node.server.parse::<IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+
+    ServerName::try_from(node.server.to_owned()).map_err(|_| "无效的 server 域名")
+}
+
+fn run_trojan_real_probe(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    tls_status: &TlsProbeStatus,
+) -> ProtocolProbeStatus {
+    let Some(password) = node.password.as_deref() else {
+        return ProtocolProbeStatus::Failed("缺少 password".to_owned());
+    };
+
+    if !matches!(tls_status, TlsProbeStatus::Passed) {
+        return ProtocolProbeStatus::Partial("需要TLS通过".to_owned());
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(hex_sha224(password).as_bytes());
+    payload.extend_from_slice(b"\r\n");
+    payload.extend_from_slice(&build_trojan_connect_request());
+
+    let mut last_error = String::new();
+    for socket_addr in socket_addrs {
+        let mut tls_stream = match tls_connect(node, socket_addr, timeout) {
+            Ok(stream) => stream,
+            Err(error) => {
+                last_error = error;
+                continue;
+            }
+        };
+
+        if let Err(error) = tls_stream.write_all(&payload) {
+            last_error = format!("发送Trojan认证失败: {error}");
+            continue;
+        }
+        if let Err(error) = tls_stream.flush() {
+            last_error = format!("刷新Trojan认证失败: {error}");
+            continue;
+        }
+
+        let mut one_byte = [0_u8; 1];
+        match tls_stream.read(&mut one_byte) {
+            Ok(0) => {
+                last_error = "认证后连接被关闭".to_owned();
+            }
+            Ok(_) => {
+                return ProtocolProbeStatus::Passed("Trojan真实握手成功(收到响应)".to_owned());
+            }
+            Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+                return ProtocolProbeStatus::Passed(
+                    "Trojan真实握手成功(写入后连接保持)".to_owned(),
+                );
+            }
+            Err(error) => {
+                last_error = format!("Trojan读取响应失败: {error}");
+            }
+        }
+    }
+
+    ProtocolProbeStatus::Failed(if last_error.is_empty() {
+        "Trojan真实握手失败".to_owned()
+    } else {
+        last_error
+    })
+}
+
+fn run_vless_real_probe(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    tls_status: &TlsProbeStatus,
+) -> ProtocolProbeStatus {
+    let Some(uuid) = node.uuid.as_deref() else {
+        return ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned());
+    };
+
+    let uuid_bytes = match parse_uuid_bytes(uuid) {
+        Some(bytes) => bytes,
+        None => return ProtocolProbeStatus::Failed("uuid/id 格式无效".to_owned()),
+    };
+
+    let require_tls = vless_requires_tls(node);
+    if require_tls && !matches!(tls_status, TlsProbeStatus::Passed) {
+        return ProtocolProbeStatus::Partial("TLS/REALITY要求未满足".to_owned());
+    }
+
+    let request = build_vless_request(&uuid_bytes);
+    let mut last_error = String::new();
+
+    for socket_addr in socket_addrs {
+        let outcome = if require_tls {
+            match tls_connect(node, socket_addr, timeout) {
+                Ok(mut stream) => send_and_expect_open(&mut stream, &request, "VLESS"),
+                Err(error) => Err(error),
+            }
+        } else {
+            match TcpStream::connect_timeout(socket_addr, timeout) {
+                Ok(mut stream) => {
+                    let _ = stream.set_read_timeout(Some(timeout));
+                    let _ = stream.set_write_timeout(Some(timeout));
+                    send_and_expect_open(&mut stream, &request, "VLESS")
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        };
+
+        match outcome {
+            Ok(message) => return ProtocolProbeStatus::Passed(message),
+            Err(error) => last_error = error,
+        }
+    }
+
+    ProtocolProbeStatus::Failed(if last_error.is_empty() {
+        "VLESS真实握手失败".to_owned()
+    } else {
+        last_error
+    })
+}
+
+fn run_vmess_probe(node: &ProxyNode, tls_status: &TlsProbeStatus) -> ProtocolProbeStatus {
+    if node.uuid.is_none() {
+        return ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned());
+    }
+
+    if node
+        .security
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("none"))
+    {
+        return ProtocolProbeStatus::Partial("security=none".to_owned());
+    }
+
+    if node.tls == Some(true) && !matches!(tls_status, TlsProbeStatus::Passed) {
+        return ProtocolProbeStatus::Partial("TLS要求未满足".to_owned());
+    }
+
+    ProtocolProbeStatus::Partial("VMess AEAD 真实握手待实现".to_owned())
+}
+
+fn vless_requires_tls(node: &ProxyNode) -> bool {
+    if node.tls == Some(true) {
+        return true;
+    }
+    if let Some(security) = node.security.as_deref() {
+        return matches!(
+            security.to_ascii_lowercase().as_str(),
+            "tls" | "xtls" | "reality"
+        );
+    }
+    false
+}
+
+fn send_and_expect_open<T: Read + Write>(
+    stream: &mut T,
+    payload: &[u8],
+    protocol: &str,
+) -> Result<String, String> {
+    stream
+        .write_all(payload)
+        .map_err(|error| format!("{protocol}发送请求失败: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("{protocol}刷新请求失败: {error}"))?;
+
+    let mut one_byte = [0_u8; 1];
+    match stream.read(&mut one_byte) {
+        Ok(0) => Err(format!("{protocol}请求后连接被关闭")),
+        Ok(_) => Ok(format!("{protocol}真实握手成功(收到响应)")),
+        Err(error) if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            Ok(format!("{protocol}真实握手成功(写入后连接保持)"))
+        }
+        Err(error) => Err(format!("{protocol}读取响应失败: {error}")),
+    }
+}
+
+fn build_trojan_connect_request() -> Vec<u8> {
+    let mut request = Vec::with_capacity(32);
+    let host = b"www.example.com";
+    request.push(0x01);
+    request.push(0x03);
+    request.push(host.len() as u8);
+    request.extend_from_slice(host);
+    request.extend_from_slice(&80_u16.to_be_bytes());
+    request.extend_from_slice(b"\r\n");
+    request
+}
+
+fn build_vless_request(uuid: &[u8; 16]) -> Vec<u8> {
+    let mut request = Vec::with_capacity(64);
+    let host = b"www.example.com";
+    request.push(0x00);
+    request.extend_from_slice(uuid);
+    request.push(0x00);
+    request.push(0x01);
+    request.extend_from_slice(&80_u16.to_be_bytes());
+    request.push(0x02);
+    request.push(host.len() as u8);
+    request.extend_from_slice(host);
+    request
+}
+
+fn parse_uuid_bytes(input: &str) -> Option<[u8; 16]> {
+    let compact = input.chars().filter(|ch| *ch != '-').collect::<String>();
+    if compact.len() != 32 {
+        return None;
+    }
+
+    let mut output = [0_u8; 16];
+    for (index, chunk_start) in (0..32).step_by(2).enumerate() {
+        let chunk = &compact[chunk_start..chunk_start + 2];
+        output[index] = u8::from_str_radix(chunk, 16).ok()?;
+    }
+    Some(output)
+}
+
+fn hex_sha224(input: &str) -> String {
+    let digest = sha224(input.as_bytes());
+    bytes_to_hex(&digest)
+}
+
+fn sha224(input: &[u8]) -> [u8; 28] {
+    const H0: [u32; 8] = [
+        0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7,
+        0xbefa4fa4,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let mut state = H0;
+    let padded = sha256_pad(input);
+
+    for chunk in padded.chunks_exact(64) {
+        let mut w = [0_u32; 64];
+        for (index, block) in chunk.chunks_exact(4).enumerate().take(16) {
+            w[index] = u32::from_be_bytes([block[0], block[1], block[2], block[3]]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = state[0];
+        let mut b = state[1];
+        let mut c = state[2];
+        let mut d = state[3];
+        let mut e = state[4];
+        let mut f = state[5];
+        let mut g = state[6];
+        let mut h = state[7];
+
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+        state[5] = state[5].wrapping_add(f);
+        state[6] = state[6].wrapping_add(g);
+        state[7] = state[7].wrapping_add(h);
+    }
+
+    let mut output = [0_u8; 28];
+    for (index, word) in state.iter().take(7).enumerate() {
+        output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    output
+}
+
+fn sha256_pad(input: &[u8]) -> Vec<u8> {
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity(input.len() + 72);
+    padded.extend_from_slice(input);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    padded
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(nibble_to_hex(byte >> 4));
+        output.push(nibble_to_hex(byte & 0x0F));
+    }
+    output
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => '0',
+    }
+}
+
 fn run_protocol_probe(
     node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
     tls_status: &TlsProbeStatus,
     tcp_successes: usize,
     attempts: u8,
@@ -1102,38 +1545,9 @@ fn run_protocol_probe(
     }
 
     match protocol.as_str() {
-        "trojan" => {
-            if node.password.is_none() {
-                ProtocolProbeStatus::Failed("缺少 password".to_owned())
-            } else if !matches!(tls_status, TlsProbeStatus::Passed) {
-                ProtocolProbeStatus::Partial("需要TLS通过".to_owned())
-            } else {
-                ProtocolProbeStatus::Passed("password+TLS就绪".to_owned())
-            }
-        }
-        "vmess" | "vless" => {
-            if node.uuid.is_none() {
-                ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned())
-            } else if node
-                .security
-                .as_deref()
-                .is_some_and(|value| value.eq_ignore_ascii_case("none"))
-            {
-                ProtocolProbeStatus::Partial("security=none".to_owned())
-            } else if node.tls == Some(true) && !matches!(tls_status, TlsProbeStatus::Passed) {
-                ProtocolProbeStatus::Partial("TLS要求未满足".to_owned())
-            } else if protocol == "vless"
-                && node
-                    .flow
-                    .as_deref()
-                    .is_some_and(|value| value.eq_ignore_ascii_case("xtls-rprx-vision"))
-                && !matches!(tls_status, TlsProbeStatus::Passed)
-            {
-                ProtocolProbeStatus::Partial("VISION 需要 TLS/REALITY".to_owned())
-            } else {
-                ProtocolProbeStatus::Passed("身份字段完整".to_owned())
-            }
-        }
+        "trojan" => run_trojan_real_probe(node, socket_addrs, timeout, tls_status),
+        "vless" => run_vless_real_probe(node, socket_addrs, timeout, tls_status),
+        "vmess" => run_vmess_probe(node, tls_status),
         "tuic" => {
             if node.uuid.is_none() || node.password.is_none() {
                 ProtocolProbeStatus::Failed("缺少 uuid/password".to_owned())
@@ -1142,7 +1556,7 @@ fn run_protocol_probe(
             } else if node.alpn.is_none() {
                 ProtocolProbeStatus::Partial("建议配置 ALPN".to_owned())
             } else {
-                ProtocolProbeStatus::Skipped("QUIC真实握手待实现".to_owned())
+                ProtocolProbeStatus::Partial("已验证UDP，QUIC真实握手待实现".to_owned())
             }
         }
         "hysteria" | "hysteria2" => {
@@ -1153,7 +1567,7 @@ fn run_protocol_probe(
             } else if node.alpn.is_none() {
                 ProtocolProbeStatus::Partial("建议配置 ALPN".to_owned())
             } else {
-                ProtocolProbeStatus::Skipped("QUIC真实握手待实现".to_owned())
+                ProtocolProbeStatus::Partial("已验证UDP，QUIC真实握手待实现".to_owned())
             }
         }
         _ => ProtocolProbeStatus::Skipped("该协议未配置握手探测".to_owned()),
@@ -1515,5 +1929,25 @@ mod tests {
         assert!(is_udp_required_protocol("tuic"));
         assert!(is_udp_required_protocol("hysteria2"));
         assert!(!is_udp_required_protocol("trojan"));
+    }
+
+    #[test]
+    fn parses_uuid_bytes() {
+        let parsed = parse_uuid_bytes("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            parsed,
+            [
+                0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+                0x00, 0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn computes_sha224_correctly() {
+        assert_eq!(
+            hex_sha224("test"),
+            "90a3ed9e32b2aaf4c61c410eb925426119e1a9dc53d4286ade99a809"
+        );
     }
 }

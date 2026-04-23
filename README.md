@@ -13,6 +13,9 @@
 - TCP 质量指标（抖动 jitter、丢包 loss）
 - UDP 可用性探测（成功/部分/失败 + 响应耗时）
 - TLS ClientHello 预检（可选，按协议自动筛选目标）
+- 协议真实握手 v2（trojan / vless）
+  - 支持 TLS 真握手后发送协议请求帧
+  - 按“收到响应 / 连接保持 / 连接关闭”分类结果
 - 首包时间 TTFB 基线探测（TLS/HTTP 首包）
 - 持续稳定性测试（30s/60s 窗口，超时率/连续失败）
 - 安全性评估（高/中/低，0~100 综合评分）
@@ -30,8 +33,7 @@ cargo run
 
 ## 后续可扩展方向
 
-- 按协议实现真实代理握手检测（trojan/vmess/vless 等）
-- 补齐 QUIC/REALITY 协议真实握手（tuic/hysteria2/vless-reality）
+- 补齐 VMess AEAD 与 QUIC/REALITY 真实握手（tuic/hysteria2/vless-reality 细化）
 - 支持从本地 YAML 文件导入
 - 导出检测结果 CSV/JSON
 - 增加历史对比与回归告警

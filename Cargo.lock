@@ -700,6 +700,8 @@ dependencies = [
  "egui_extras",
  "image",
  "reqwest",
+ "ring",
+ "rustls",
  "serde",
  "serde_yaml",
 ]
