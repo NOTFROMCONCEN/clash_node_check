@@ -8,7 +8,8 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::checker::{
     start_check, CheckEvent, CheckOptions, EncryptionLevel, NodeCheckResult, NodeStatus,
-    ProtocolProbeStatus, SecurityLevel, StartSummary, TlsProbeStatus,
+    ProtocolProbeStatus, SecurityLevel, StabilityLevel, StartSummary, TlsProbeStatus,
+    TtfbProbeStatus, UdpProbeStatus,
 };
 
 pub struct ClashCheckerApp {
@@ -17,6 +18,7 @@ pub struct ClashCheckerApp {
     attempts: u32,
     workers: u32,
     enable_tls_probe: bool,
+    stability_window_secs: u32,
     search_text: String,
     row_filter: RowFilter,
     checking: bool,
@@ -39,6 +41,7 @@ impl ClashCheckerApp {
             attempts: 3,
             workers: 24,
             enable_tls_probe: true,
+            stability_window_secs: 0,
             search_text: String::new(),
             row_filter: RowFilter::All,
             checking: false,
@@ -65,6 +68,7 @@ impl ClashCheckerApp {
             attempts: self.attempts.clamp(1, 10) as u8,
             workers: self.workers.clamp(1, 128) as usize,
             enable_tls_probe: self.enable_tls_probe,
+            stability_window_secs: self.stability_window_secs.clamp(0, 60) as u16,
         };
 
         self.results.clear();
@@ -99,10 +103,11 @@ impl ClashCheckerApp {
                         self.results.push(result);
                         let checked = self.results.len();
                         self.status_line = format!(
-                            "已检测 {checked}/{} | TCP可连 {} | 协议通过 {} | 严格通过 {} | 失败 {}",
+                            "已检测 {checked}/{} | TCP可连 {} | UDP通过 {} | TTFB通过 {} | 严格通过 {} | 失败 {}",
                             self.start_summary.total.max(checked),
                             self.tcp_alive_count(),
-                            self.protocol_probe_pass_count(),
+                            self.udp_pass_count(),
+                            self.ttfb_pass_count(),
                             self.pass_count(),
                             self.fail_count()
                         );
@@ -110,10 +115,11 @@ impl ClashCheckerApp {
                     CheckEvent::Finished => {
                         self.checking = false;
                         self.status_line = format!(
-                            "检测完成：共 {} 个，TCP可连 {} 个，协议通过 {} 个，严格通过 {} 个，失败 {} 个",
+                            "检测完成：共 {} 个，TCP可连 {} 个，UDP通过 {} 个，TTFB通过 {} 个，严格通过 {} 个，失败 {} 个",
                             self.results.len(),
                             self.tcp_alive_count(),
-                            self.protocol_probe_pass_count(),
+                            self.udp_pass_count(),
+                            self.ttfb_pass_count(),
                             self.pass_count(),
                             self.fail_count()
                         );
@@ -195,6 +201,41 @@ impl ClashCheckerApp {
                     ProtocolProbeStatus::Partial(_) | ProtocolProbeStatus::Skipped(_)
                 )
             })
+            .count()
+    }
+
+    fn udp_pass_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.udp_status.is_passed())
+            .count()
+    }
+
+    fn udp_fail_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| matches!(result.udp_status, UdpProbeStatus::Failed(_)))
+            .count()
+    }
+
+    fn ttfb_pass_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.ttfb_status.is_passed())
+            .count()
+    }
+
+    fn ttfb_fail_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| matches!(result.ttfb_status, TtfbProbeStatus::Failed(_)))
+            .count()
+    }
+
+    fn stability_high_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|result| result.stability.level == StabilityLevel::High)
             .count()
     }
 
@@ -329,6 +370,26 @@ impl ClashCheckerApp {
                 self.protocol_probe_partial_count().to_string(),
             );
             summary_tile(ui, "协议失败", self.protocol_probe_fail_count().to_string());
+            summary_tile(
+                ui,
+                "UDP通过",
+                format!(
+                    "{} ({:.1}%)",
+                    self.udp_pass_count(),
+                    self.percent(self.udp_pass_count())
+                ),
+            );
+            summary_tile(ui, "UDP失败", self.udp_fail_count().to_string());
+            summary_tile(
+                ui,
+                "TTFB通过",
+                format!(
+                    "{} ({:.1}%)",
+                    self.ttfb_pass_count(),
+                    self.percent(self.ttfb_pass_count())
+                ),
+            );
+            summary_tile(ui, "TTFB失败", self.ttfb_fail_count().to_string());
         });
 
         ui.add_space(8.0);
@@ -388,6 +449,17 @@ impl ClashCheckerApp {
                     self.percent(self.weak_or_plaintext_count())
                 ),
             );
+            if self.stability_window_secs > 0 {
+                summary_tile(
+                    ui,
+                    "稳定高",
+                    format!(
+                        "{} ({:.1}%)",
+                        self.stability_high_count(),
+                        self.percent(self.stability_high_count())
+                    ),
+                );
+            }
         });
     }
 
@@ -409,6 +481,8 @@ impl ClashCheckerApp {
             RowFilter::HighRisk => {
                 result.security.security_level == SecurityLevel::Low
                     || result.security.encryption_level == EncryptionLevel::Plaintext
+                    || matches!(result.stability.level, StabilityLevel::Low)
+                    || matches!(result.udp_status, UdpProbeStatus::Failed(_))
             }
         };
         if !filter_match {
@@ -444,6 +518,11 @@ impl ClashCheckerApp {
             .column(Column::initial(80.0).at_least(60.0))
             .column(Column::initial(90.0).at_least(70.0))
             .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(90.0).at_least(70.0))
+            .column(Column::initial(96.0).at_least(76.0))
+            .column(Column::initial(230.0).at_least(160.0))
+            .column(Column::initial(220.0).at_least(160.0))
+            .column(Column::initial(180.0).at_least(120.0))
             .column(Column::initial(240.0).at_least(160.0))
             .column(Column::initial(360.0).at_least(220.0))
             .column(Column::initial(90.0).at_least(70.0))
@@ -468,6 +547,21 @@ impl ClashCheckerApp {
                 });
                 header.col(|ui| {
                     ui.strong("TCP成功");
+                });
+                header.col(|ui| {
+                    ui.strong("抖动");
+                });
+                header.col(|ui| {
+                    ui.strong("丢包");
+                });
+                header.col(|ui| {
+                    ui.strong("UDP");
+                });
+                header.col(|ui| {
+                    ui.strong("TTFB");
+                });
+                header.col(|ui| {
+                    ui.strong("稳定性");
                 });
                 header.col(|ui| {
                     ui.strong("协议探测");
@@ -517,6 +611,89 @@ impl ClashCheckerApp {
                     });
                     row.col(|ui| {
                         ui.label(format!("{}/{}", result.tcp_successes, result.tcp_attempts));
+                    });
+                    row.col(|ui| {
+                        ui.label(
+                            result
+                                .tcp_jitter_ms
+                                .map(|value| format!("{value} ms"))
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{:.1}%", result.tcp_loss_percent));
+                    });
+                    row.col(|ui| {
+                        let (udp_text, udp_color) = match &result.udp_status {
+                            UdpProbeStatus::Passed(message) => (
+                                result
+                                    .udp_latency_ms
+                                    .map(|latency| format!("通过({message}, {latency}ms)"))
+                                    .unwrap_or_else(|| format!("通过({message})")),
+                                egui::Color32::from_rgb(32, 145, 91),
+                            ),
+                            UdpProbeStatus::Partial(message) => (
+                                format!("部分({message})"),
+                                egui::Color32::from_rgb(194, 122, 0),
+                            ),
+                            UdpProbeStatus::Failed(message) => (
+                                format!("失败({message})"),
+                                egui::Color32::from_rgb(190, 64, 64),
+                            ),
+                            UdpProbeStatus::Skipped(message) => {
+                                (format!("跳过({message})"), ui.visuals().weak_text_color())
+                            }
+                        };
+                        let response = ui.colored_label(udp_color, short_text(&udp_text, 30));
+                        response.on_hover_text(udp_text);
+                    });
+                    row.col(|ui| {
+                        let (ttfb_text, ttfb_color) = match &result.ttfb_status {
+                            TtfbProbeStatus::Passed(message) => (
+                                result
+                                    .ttfb_ms
+                                    .map(|latency| format!("通过({message}, {latency}ms)"))
+                                    .unwrap_or_else(|| format!("通过({message})")),
+                                egui::Color32::from_rgb(32, 145, 91),
+                            ),
+                            TtfbProbeStatus::Failed(message) => (
+                                format!("失败({message})"),
+                                egui::Color32::from_rgb(190, 64, 64),
+                            ),
+                            TtfbProbeStatus::Skipped(message) => {
+                                (format!("跳过({message})"), ui.visuals().weak_text_color())
+                            }
+                        };
+                        let response = ui.colored_label(ttfb_color, short_text(&ttfb_text, 30));
+                        response.on_hover_text(ttfb_text);
+                    });
+                    row.col(|ui| {
+                        let (stability_text, stability_color) = match result.stability.level {
+                            StabilityLevel::High => (
+                                format!("高 ({:.1}%超时)", result.stability.timeout_rate_percent),
+                                egui::Color32::from_rgb(32, 145, 91),
+                            ),
+                            StabilityLevel::Medium => (
+                                format!("中 ({:.1}%超时)", result.stability.timeout_rate_percent),
+                                egui::Color32::from_rgb(194, 122, 0),
+                            ),
+                            StabilityLevel::Low => (
+                                format!("低 ({:.1}%超时)", result.stability.timeout_rate_percent),
+                                egui::Color32::from_rgb(190, 64, 64),
+                            ),
+                            StabilityLevel::Disabled => {
+                                ("关闭".to_owned(), ui.visuals().weak_text_color())
+                            }
+                        };
+                        let response =
+                            ui.colored_label(stability_color, short_text(&stability_text, 24));
+                        response.on_hover_text(format!(
+                            "窗口: {} 秒\n采样: {}\n失败: {}\n最大连续失败: {}",
+                            result.stability.window_secs,
+                            result.stability.samples,
+                            result.stability.failures,
+                            result.stability.max_consecutive_failures
+                        ));
                     });
                     row.col(|ui| {
                         let (probe_text, probe_color) = match &result.protocol_probe {
@@ -678,6 +855,10 @@ impl eframe::App for ClashCheckerApp {
                 ui.add(egui::Slider::new(&mut self.workers, 1..=128).suffix(" 线程"));
 
                 ui.checkbox(&mut self.enable_tls_probe, "TLS 握手检测");
+                ui.label("稳定性窗口");
+                ui.selectable_value(&mut self.stability_window_secs, 0, "关闭");
+                ui.selectable_value(&mut self.stability_window_secs, 30, "30秒");
+                ui.selectable_value(&mut self.stability_window_secs, 60, "60秒");
 
                 let button = egui::Button::new(if self.checking {
                     "检测中..."
@@ -735,7 +916,7 @@ impl eframe::App for ClashCheckerApp {
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_min_width(2850.0);
+                            ui.set_min_width(3650.0);
                             self.table_ui(ui, &filtered_indices);
                         });
                 }
@@ -761,6 +942,11 @@ impl eframe::App for ClashCheckerApp {
                     ui.heading("各列含义");
                     ui.label("TCP均延迟：TCP 成功采样的平均耗时。");
                     ui.label("TCP成功：采样成功次数 / 采样总次数。");
+                    ui.label("抖动：成功采样之间的延迟波动（相邻差值平均）。");
+                    ui.label("丢包：TCP 采样失败占比。");
+                    ui.label("UDP：UDP 可达性探测结果（通过/部分/失败/跳过）。");
+                    ui.label("TTFB：首包时间探测（当前以 TLS/HTTP 首包为基线实现）。");
+                    ui.label("稳定性：在 30/60 秒窗口内统计超时率与连续失败次数。");
                     ui.label("协议探测：按协议检查关键认证字段与握手前置条件。");
                     ui.label("TLS：对 TLS 类协议执行 ClientHello 预检的结果。");
                     ui.label("安全：综合协议、TLS、证书校验、稳定性得出的安全等级。");
@@ -778,6 +964,7 @@ impl eframe::App for ClashCheckerApp {
                     ui.label("双击列表任意节点，可打开“节点详细信息”窗口。");
                     ui.label("详细信息里会显示协议参数、TLS状态、安全等级、评分与评估说明。");
                     ui.label("协议探测=跳过：通常表示该协议真实握手将在后续版本补齐。");
+                    ui.label("TTFB=跳过：代表该协议暂未定义可比首包探测方式。");
                     ui.add_space(8.0);
 
                     ui.heading("常见疑问");
@@ -833,6 +1020,15 @@ impl eframe::App for ClashCheckerApp {
                             );
                             detail_row(
                                 ui,
+                                "TCP抖动",
+                                &result
+                                    .tcp_jitter_ms
+                                    .map(|value| format!("{value} ms"))
+                                    .unwrap_or_else(|| "-".to_owned()),
+                            );
+                            detail_row(ui, "TCP丢包", &format!("{:.1}%", result.tcp_loss_percent));
+                            detail_row(
+                                ui,
                                 "TLS结果",
                                 &match &result.tls_status {
                                     TlsProbeStatus::Passed => result
@@ -842,6 +1038,46 @@ impl eframe::App for ClashCheckerApp {
                                     TlsProbeStatus::Disabled => "关闭".to_owned(),
                                     TlsProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
                                     TlsProbeStatus::Failed(reason) => format!("失败 ({reason})"),
+                                },
+                            );
+                            detail_row(
+                                ui,
+                                "UDP结果",
+                                &match &result.udp_status {
+                                    UdpProbeStatus::Passed(reason) => result
+                                        .udp_latency_ms
+                                        .map(|latency| format!("通过 ({reason}, {latency} ms)"))
+                                        .unwrap_or_else(|| format!("通过 ({reason})")),
+                                    UdpProbeStatus::Partial(reason) => format!("部分 ({reason})"),
+                                    UdpProbeStatus::Failed(reason) => format!("失败 ({reason})"),
+                                    UdpProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
+                                },
+                            );
+                            detail_row(
+                                ui,
+                                "TTFB结果",
+                                &match &result.ttfb_status {
+                                    TtfbProbeStatus::Passed(reason) => result
+                                        .ttfb_ms
+                                        .map(|latency| format!("通过 ({reason}, {latency} ms)"))
+                                        .unwrap_or_else(|| format!("通过 ({reason})")),
+                                    TtfbProbeStatus::Failed(reason) => format!("失败 ({reason})"),
+                                    TtfbProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
+                                },
+                            );
+                            detail_row(
+                                ui,
+                                "稳定性",
+                                &if result.stability.level == StabilityLevel::Disabled {
+                                    "关闭".to_owned()
+                                } else {
+                                    format!(
+                                        "{}（窗口 {} 秒，超时率 {:.1}%，最大连续失败 {}）",
+                                        result.stability.level.label(),
+                                        result.stability.window_secs,
+                                        result.stability.timeout_rate_percent,
+                                        result.stability.max_consecutive_failures
+                                    )
                                 },
                             );
                             detail_row(ui, "协议探测", &result.protocol_probe.short_label());
