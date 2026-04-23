@@ -393,6 +393,7 @@ impl ClashCheckerApp {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
+            .sense(egui::Sense::click())
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::initial(280.0).at_least(180.0))
             .column(Column::initial(80.0).at_least(64.0))
@@ -543,7 +544,11 @@ impl ClashCheckerApp {
                         response.on_hover_text(full);
                     });
 
-                    if row.response().double_clicked() {
+                    let row_response = row.response();
+                    if row_response.clicked() {
+                        self.selected_result_index = Some(result_index);
+                    }
+                    if row_response.double_clicked() {
                         self.selected_result_index = Some(result_index);
                         self.show_node_detail = true;
                     }
@@ -645,6 +650,7 @@ impl eframe::App for ClashCheckerApp {
                 filtered_indices.len(),
                 self.results.len()
             ));
+            ui.label("提示：单击行可选中，双击行打开节点详细信息。");
             ui.add_space(6.0);
 
             egui::Frame::group(ui.style()).show(ui, |ui| {
