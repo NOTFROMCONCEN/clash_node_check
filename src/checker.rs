@@ -1,10 +1,10 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::subscription::{parse_subscription, ProxyNode};
 
@@ -184,14 +184,17 @@ fn run_check(
     tx.send(CheckEvent::Started(summary))
         .map_err(|error| error.to_string())?;
 
+    let node_count = nodes.len();
     let queue = Arc::new(Mutex::new(VecDeque::from(nodes)));
-    let worker_count = options.workers.max(1);
+    let worker_count = options.workers.max(1).min(node_count.max(1));
+    let probe_cache = Arc::new(Mutex::new(HashMap::<String, EndpointProbeResult>::new()));
     let mut handles = Vec::new();
 
     for _ in 0..worker_count {
         let node_tx = tx.clone();
         let node_options = options.clone();
         let node_queue = Arc::clone(&queue);
+        let node_probe_cache = Arc::clone(&probe_cache);
         handles.push(thread::spawn(move || loop {
             let maybe_node = {
                 let mut queue_guard = node_queue.lock().expect("queue poisoned");
@@ -202,7 +205,7 @@ fn run_check(
                 break;
             };
 
-            let result = check_node(node, &node_options);
+            let result = check_node(node, &node_options, &node_probe_cache);
             let _ = node_tx.send(CheckEvent::NodeFinished(result));
         }));
     }
@@ -215,15 +218,72 @@ fn run_check(
         .map_err(|error| error.to_string())
 }
 
-fn check_node(node: ProxyNode, options: &CheckOptions) -> NodeCheckResult {
+fn check_node(
+    node: ProxyNode,
+    options: &CheckOptions,
+    probe_cache: &Arc<Mutex<HashMap<String, EndpointProbeResult>>>,
+) -> NodeCheckResult {
+    let cache_key = endpoint_cache_key(&node);
+    let cached_probe = {
+        let guard = probe_cache.lock().expect("probe cache poisoned");
+        guard.get(&cache_key).cloned()
+    };
+
+    let probe = if let Some(probe) = cached_probe {
+        probe
+    } else {
+        let calculated = collect_endpoint_probe(&node, options);
+        let mut guard = probe_cache.lock().expect("probe cache poisoned");
+        guard
+            .entry(cache_key)
+            .or_insert_with(|| calculated.clone())
+            .clone()
+    };
+
+    match probe {
+        EndpointProbeResult::DnsFailed(reason) => dns_failed(node, reason, options.attempts),
+        EndpointProbeResult::Probed {
+            resolved_ip_count,
+            tcp_probe,
+            tls_probe,
+        } => build_result(
+            node,
+            resolved_ip_count,
+            tcp_probe,
+            tls_probe,
+            options.attempts.max(1),
+        ),
+    }
+}
+
+fn endpoint_cache_key(node: &ProxyNode) -> String {
+    format!(
+        "{}:{}|{}",
+        node.server,
+        node.port,
+        node.node_type.to_ascii_lowercase()
+    )
+}
+
+#[derive(Clone, Debug)]
+enum EndpointProbeResult {
+    DnsFailed(String),
+    Probed {
+        resolved_ip_count: usize,
+        tcp_probe: TcpProbe,
+        tls_probe: TlsProbeStatusWithLatency,
+    },
+}
+
+fn collect_endpoint_probe(node: &ProxyNode, options: &CheckOptions) -> EndpointProbeResult {
     let address = format!("{}:{}", node.server, node.port);
     let socket_addrs = match address.to_socket_addrs() {
         Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(error) => return dns_failed(node, format!("DNS 解析失败：{error}"), options.attempts),
+        Err(error) => return EndpointProbeResult::DnsFailed(format!("DNS 解析失败：{error}")),
     };
 
     if socket_addrs.is_empty() {
-        return dns_failed(node, "没有可用地址".to_owned(), options.attempts);
+        return EndpointProbeResult::DnsFailed("没有可用地址".to_owned());
     }
 
     let resolved_ip_count = socket_addrs
@@ -232,15 +292,13 @@ fn check_node(node: ProxyNode, options: &CheckOptions) -> NodeCheckResult {
         .collect::<HashSet<_>>()
         .len();
     let tcp_probe = run_tcp_probe(&socket_addrs, options.attempts.max(1), options.timeout);
-    let tls_probe = run_tls_probe(&node, &socket_addrs, options, tcp_probe.success_addr);
+    let tls_probe = run_tls_probe(node, &socket_addrs, options, tcp_probe.success_addr);
 
-    build_result(
-        node,
+    EndpointProbeResult::Probed {
         resolved_ip_count,
         tcp_probe,
         tls_probe,
-        options.attempts.max(1),
-    )
+    }
 }
 
 fn summarize_subscription(nodes: &[ProxyNode]) -> StartSummary {
@@ -382,7 +440,7 @@ fn run_tls_probe(
         let _ = tcp_stream.set_write_timeout(Some(options.timeout));
         let started_at = Instant::now();
 
-        match tls_client_hello_probe(&mut tcp_stream, options.timeout) {
+        match tls_client_hello_probe(&mut tcp_stream) {
             Ok(_) => {
                 return TlsProbeStatusWithLatency {
                     status: TlsProbeStatus::Passed,
@@ -401,7 +459,7 @@ fn run_tls_probe(
     }
 }
 
-fn tls_client_hello_probe(stream: &mut TcpStream, _timeout: Duration) -> Result<(), String> {
+fn tls_client_hello_probe(stream: &mut TcpStream) -> Result<(), String> {
     let client_hello = build_client_hello_packet();
     stream
         .write_all(&client_hello)
@@ -432,7 +490,10 @@ fn build_client_hello_packet() -> Vec<u8> {
     packet.extend_from_slice(&[0x01, 0x00, 0x00, 0x2B]);
     packet.extend_from_slice(&[0x03, 0x03]);
 
-    let now = Instant::now().elapsed().as_nanos() as u64;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
     let mut random = [0_u8; 32];
     for (index, byte) in random.iter_mut().enumerate() {
         let shifted = now.rotate_left((index % 32) as u32);

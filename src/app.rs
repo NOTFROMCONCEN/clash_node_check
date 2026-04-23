@@ -17,6 +17,8 @@ pub struct ClashCheckerApp {
     attempts: u32,
     workers: u32,
     enable_tls_probe: bool,
+    search_text: String,
+    row_filter: RowFilter,
     checking: bool,
     show_metric_guide: bool,
     status_line: String,
@@ -35,6 +37,8 @@ impl ClashCheckerApp {
             attempts: 3,
             workers: 24,
             enable_tls_probe: true,
+            search_text: String::new(),
+            row_filter: RowFilter::All,
             checking: false,
             show_metric_guide: false,
             status_line: "输入 Clash 订阅地址后开始检测".to_owned(),
@@ -338,7 +342,48 @@ impl ClashCheckerApp {
         });
     }
 
-    fn table_ui(&self, ui: &mut egui::Ui) {
+    fn filtered_result_indices(&self) -> Vec<usize> {
+        self.results
+            .iter()
+            .enumerate()
+            .filter(|(_, result)| self.matches_filter(result))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn matches_filter(&self, result: &NodeCheckResult) -> bool {
+        let filter_match = match self.row_filter {
+            RowFilter::All => true,
+            RowFilter::Pass => result.status == NodeStatus::Pass,
+            RowFilter::Warn => result.status == NodeStatus::Warn,
+            RowFilter::Fail => result.status == NodeStatus::Fail,
+            RowFilter::HighRisk => {
+                result.security.security_level == SecurityLevel::Low
+                    || result.security.encryption_level == EncryptionLevel::Plaintext
+            }
+        };
+        if !filter_match {
+            return false;
+        }
+
+        let keyword = self.search_text.trim().to_ascii_lowercase();
+        if keyword.is_empty() {
+            return true;
+        }
+
+        let message = format!(
+            "{} {} {} {} {}",
+            result.node.name,
+            result.node.server,
+            result.node.node_type,
+            result.message,
+            result.security.note
+        )
+        .to_ascii_lowercase();
+        message.contains(&keyword)
+    }
+
+    fn table_ui(&self, ui: &mut egui::Ui, row_indices: &[usize]) {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -390,8 +435,8 @@ impl ClashCheckerApp {
                 });
             })
             .body(|body| {
-                body.rows(28.0, self.results.len(), |mut row| {
-                    let result = &self.results[row.index()];
+                body.rows(28.0, row_indices.len(), |mut row| {
+                    let result = &self.results[row_indices[row.index()]];
                     row.col(|ui| {
                         ui.label(&result.node.name);
                     });
@@ -559,10 +604,33 @@ impl eframe::App for ClashCheckerApp {
 
             ui.add_space(8.0);
             ui.label(&self.status_line);
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("结果筛选");
+                ui.selectable_value(&mut self.row_filter, RowFilter::All, "全部");
+                ui.selectable_value(&mut self.row_filter, RowFilter::Pass, "通过");
+                ui.selectable_value(&mut self.row_filter, RowFilter::Warn, "部分");
+                ui.selectable_value(&mut self.row_filter, RowFilter::Fail, "失败");
+                ui.selectable_value(&mut self.row_filter, RowFilter::HighRisk, "高风险");
+                ui.label("搜索");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search_text)
+                        .desired_width(260.0)
+                        .hint_text("节点名/服务器/原因"),
+                );
+            });
             ui.add_space(12.0);
 
             self.summary_ui(ui);
             ui.add_space(12.0);
+
+            let filtered_indices = self.filtered_result_indices();
+            ui.label(format!(
+                "当前显示：{} / {}",
+                filtered_indices.len(),
+                self.results.len()
+            ));
+            ui.add_space(6.0);
 
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_min_height(360.0);
@@ -570,12 +638,16 @@ impl eframe::App for ClashCheckerApp {
                     ui.centered_and_justified(|ui| {
                         ui.label("暂无检测结果");
                     });
+                } else if filtered_indices.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("筛选后没有匹配结果");
+                    });
                 } else {
                     egui::ScrollArea::horizontal()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_min_width(2400.0);
-                            self.table_ui(ui);
+                            self.table_ui(ui, &filtered_indices);
                         });
                 }
             });
@@ -620,6 +692,15 @@ impl eframe::App for ClashCheckerApp {
                 });
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowFilter {
+    All,
+    Pass,
+    Warn,
+    Fail,
+    HighRisk,
 }
 
 fn configure_chinese_font(ctx: &egui::Context) {
