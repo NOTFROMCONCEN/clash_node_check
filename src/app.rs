@@ -21,6 +21,8 @@ pub struct ClashCheckerApp {
     row_filter: RowFilter,
     checking: bool,
     show_metric_guide: bool,
+    show_node_detail: bool,
+    selected_result_index: Option<usize>,
     status_line: String,
     start_summary: StartSummary,
     results: Vec<NodeCheckResult>,
@@ -41,6 +43,8 @@ impl ClashCheckerApp {
             row_filter: RowFilter::All,
             checking: false,
             show_metric_guide: false,
+            show_node_detail: false,
+            selected_result_index: None,
             status_line: "输入 Clash 订阅地址后开始检测".to_owned(),
             start_summary: StartSummary::default(),
             results: Vec::new(),
@@ -65,6 +69,8 @@ impl ClashCheckerApp {
 
         self.results.clear();
         self.start_summary = StartSummary::default();
+        self.selected_result_index = None;
+        self.show_node_detail = false;
         self.rx = Some(rx);
         self.checking = true;
         self.status_line = "正在下载订阅并执行多项检测...".to_owned();
@@ -383,7 +389,7 @@ impl ClashCheckerApp {
         message.contains(&keyword)
     }
 
-    fn table_ui(&self, ui: &mut egui::Ui, row_indices: &[usize]) {
+    fn table_ui(&mut self, ui: &mut egui::Ui, row_indices: &[usize]) {
         TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
@@ -436,7 +442,11 @@ impl ClashCheckerApp {
             })
             .body(|body| {
                 body.rows(28.0, row_indices.len(), |mut row| {
-                    let result = &self.results[row_indices[row.index()]];
+                    let result_index = row_indices[row.index()];
+                    let is_selected = self.selected_result_index == Some(result_index);
+                    row.set_selected(is_selected);
+
+                    let result = &self.results[result_index];
                     row.col(|ui| {
                         ui.label(&result.node.name);
                     });
@@ -532,6 +542,11 @@ impl ClashCheckerApp {
                         let response = ui.label(RichText::new(short_text(&full, 86)).color(color));
                         response.on_hover_text(full);
                     });
+
+                    if row.response().double_clicked() {
+                        self.selected_result_index = Some(result_index);
+                        self.show_node_detail = true;
+                    }
                 });
             });
     }
@@ -679,6 +694,16 @@ impl eframe::App for ClashCheckerApp {
                     ui.label("状态：将 DNS/TCP/TLS 汇总后的最终判定与简要原因。");
                     ui.add_space(8.0);
 
+                    ui.heading("筛选与搜索");
+                    ui.label("结果筛选：按通过/部分/失败/高风险快速过滤。");
+                    ui.label("搜索框：支持节点名、服务器、失败原因关键字匹配。");
+                    ui.add_space(8.0);
+
+                    ui.heading("详情查看");
+                    ui.label("双击列表任意节点，可打开“节点详细信息”窗口。");
+                    ui.label("详细信息里会显示协议参数、TLS状态、安全等级、评分与评估说明。");
+                    ui.add_space(8.0);
+
                     ui.heading("常见疑问");
                     ui.label("“TLS 失败 (failed to fill whole buffer)” 通常不代表订阅链接有问题。");
                     ui.label("这更常见于节点服务端策略或预检方式兼容性导致的握手未返回完整响应。");
@@ -689,6 +714,89 @@ impl eframe::App for ClashCheckerApp {
                     ui.label("绿色：通过（指标整体健康）。");
                     ui.label("橙色：部分通过（有风险项，建议复测）。");
                     ui.label("红色：失败（当前检测项不通过）。");
+                });
+        }
+
+        if self.show_node_detail {
+            let selected = self
+                .selected_result_index
+                .and_then(|index| self.results.get(index).cloned());
+            egui::Window::new("节点详细信息")
+                .open(&mut self.show_node_detail)
+                .resizable(true)
+                .default_width(860.0)
+                .show(ctx, |ui| {
+                    let Some(result) = selected else {
+                        ui.label("当前没有可查看的节点详情。");
+                        return;
+                    };
+
+                    ui.heading(&result.node.name);
+                    ui.add_space(8.0);
+
+                    egui::Grid::new("node_detail_grid")
+                        .num_columns(2)
+                        .striped(true)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            detail_row(ui, "协议", &result.node.node_type);
+                            detail_row(ui, "服务器", &result.node.server);
+                            detail_row(ui, "端口", &result.node.port.to_string());
+                            detail_row(
+                                ui,
+                                "TCP成功",
+                                &format!("{}/{}", result.tcp_successes, result.tcp_attempts),
+                            );
+                            detail_row(
+                                ui,
+                                "TCP均延迟",
+                                &result
+                                    .tcp_avg_latency_ms
+                                    .map(|value| format!("{value} ms"))
+                                    .unwrap_or_else(|| "-".to_owned()),
+                            );
+                            detail_row(
+                                ui,
+                                "TLS结果",
+                                &match &result.tls_status {
+                                    TlsProbeStatus::Passed => result
+                                        .tls_latency_ms
+                                        .map(|latency| format!("通过 ({latency} ms)"))
+                                        .unwrap_or_else(|| "通过".to_owned()),
+                                    TlsProbeStatus::Disabled => "关闭".to_owned(),
+                                    TlsProbeStatus::Skipped(reason) => format!("跳过 ({reason})"),
+                                    TlsProbeStatus::Failed(reason) => format!("失败 ({reason})"),
+                                },
+                            );
+                            detail_row(ui, "安全等级", result.security.security_level.label());
+                            detail_row(ui, "加密等级", result.security.encryption_level.label());
+                            detail_row(ui, "安全评分", &format!("{} / 100", result.security.score));
+                            detail_row(ui, "TLS配置", &option_bool_text(result.node.tls));
+                            detail_row(
+                                ui,
+                                "跳过证书校验",
+                                &option_bool_text(result.node.skip_cert_verify),
+                            );
+                            detail_row(ui, "Cipher", &option_text(result.node.cipher.as_deref()));
+                            detail_row(ui, "Network", &option_text(result.node.network.as_deref()));
+                            detail_row(
+                                ui,
+                                "ServerName/SNI",
+                                &option_text(result.node.server_name.as_deref()),
+                            );
+                            detail_row(ui, "最终状态", result.status.label());
+                        });
+
+                    ui.add_space(8.0);
+                    ui.label("评估说明");
+                    ui.separator();
+                    ui.label(if result.security.note.is_empty() {
+                        "无额外说明".to_owned()
+                    } else {
+                        result.security.note
+                    });
+                    ui.add_space(8.0);
+                    ui.label(format!("检测摘要：{}", result.message));
                 });
         }
     }
@@ -739,6 +847,24 @@ fn summary_tile(ui: &mut egui::Ui, label: &str, value: String) {
             ui.label(label);
             ui.heading(value);
         });
+}
+
+fn detail_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.strong(key);
+    ui.label(value);
+    ui.end_row();
+}
+
+fn option_text(value: Option<&str>) -> String {
+    value.unwrap_or("未知").to_owned()
+}
+
+fn option_bool_text(value: Option<bool>) -> String {
+    match value {
+        Some(true) => "是".to_owned(),
+        Some(false) => "否".to_owned(),
+        None => "未知".to_owned(),
+    }
 }
 
 fn short_text(input: &str, max_chars: usize) -> String {
