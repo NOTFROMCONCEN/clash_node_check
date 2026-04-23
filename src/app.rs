@@ -785,7 +785,7 @@ impl ClashCheckerApp {
                             NodeStatus::Fail => egui::Color32::from_rgb(190, 64, 64),
                         };
                         let full = format!("{} - {}", result.status.label(), result.message);
-                        let response = ui.label(RichText::new(short_text(&full, 86)).color(color));
+                        let response = ui.label(RichText::new(short_text(&full, 56)).color(color));
                         response.on_hover_text(full);
                     });
 
@@ -921,6 +921,30 @@ impl eframe::App for ClashCheckerApp {
                         });
                 }
             });
+
+            if let Some(result) = self
+                .selected_result_index
+                .and_then(|index| self.results.get(index))
+            {
+                ui.add_space(10.0);
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.strong(format!("选中节点：{}", result.node.name));
+                        ui.label(format!(
+                            "端点：{}:{}  |  协议：{}",
+                            result.node.server, result.node.port, result.node.node_type
+                        ));
+                        ui.label(format!(
+                            "完整状态：{} - {}",
+                            result.status.label(),
+                            result.message
+                        ));
+                        if !result.security.note.is_empty() {
+                            ui.label(format!("评估说明：{}", result.security.note));
+                        }
+                    });
+            }
         });
 
         if self.show_metric_guide {
