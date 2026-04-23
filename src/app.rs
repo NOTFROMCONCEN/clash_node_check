@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -16,7 +17,9 @@ pub struct ClashCheckerApp {
 }
 
 impl ClashCheckerApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_chinese_font(&cc.egui_ctx);
+
         Self {
             subscription_url: String::new(),
             timeout_secs: 4.0,
@@ -249,6 +252,34 @@ impl eframe::App for ClashCheckerApp {
             });
         });
     }
+}
+
+fn configure_chinese_font(ctx: &egui::Context) {
+    let candidates = [
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ];
+
+    let Some(font_bytes) = candidates.iter().find_map(|path| fs::read(path).ok()) else {
+        return;
+    };
+
+    let font_name = "system_chinese".to_owned();
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(font_name.clone(), egui::FontData::from_owned(font_bytes));
+
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, font_name.clone());
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 fn summary_tile(ui: &mut egui::Ui, label: &str, value: String) {
