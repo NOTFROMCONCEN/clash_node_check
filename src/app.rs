@@ -622,8 +622,9 @@ impl ClashCheckerApp {
             RowFilter::HighRisk => {
                 result.security.security_level == SecurityLevel::Low
                     || result.security.encryption_level == EncryptionLevel::Plaintext
-                    || result.security.gateway_level == SecurityLevel::Low
+                    || result.security.gfw_level == SecurityLevel::Low
                     || result.security.anti_tracking_level == SecurityLevel::Low
+                    || result.security.local_network_level == SecurityLevel::Low
                     || result.security.live_network_level == SecurityLevel::Low
                     || matches!(result.stability.level, StabilityLevel::Low)
                     || matches!(result.udp_status, UdpProbeStatus::Failed(_))
@@ -1482,6 +1483,14 @@ impl eframe::App for ClashCheckerApp {
                 RichText::new("宽窗口下左侧负责检测控制、筛选与订阅概览，右侧负责结果工作区；窄窗口下节点结果会放在检测控制与筛选之间。")
                     .weak(),
             );
+            ui.add(
+                egui::Label::new(
+                    RichText::new("测试结果的优劣由您的本地网络环境直接关联，本程序最初目的也是测试某一订阅在当前网络环境下的优劣，推荐您购买各家代理服务商的最基础套餐进行测试。")
+                        .small()
+                        .weak(),
+                )
+                .wrap(),
+            );
             ui.add_space(10.0);
 
             let available_width = ui.available_width();
@@ -1548,15 +1557,16 @@ impl eframe::App for ClashCheckerApp {
                             ui.label("抖动：成功采样之间的延迟波动（相邻差值平均）。");
                             ui.label("丢包：TCP 采样失败占比。");
                             ui.label("UDP：UDP 可达性探测结果（通过/部分/失败/跳过）。");
-                            ui.label("TTFB：首包时间探测（当前以 TLS/HTTP 首包为基线实现，不等同于完整代理链访问业务 URL 的真实业务首包）。");
+                            ui.label("TTFB：首包时间探测。trojan/vless 已支持通过代理链访问测试 URL 的 HTTP 首包；其中 VLESS REALITY/XTLS 当前会跳过，避免复用普通 TLS 基线误判；其余协议仍以 TLS/HTTP 首包基线实现。");
                             ui.label("稳定性：在 30/60 秒窗口内统计超时率与连续失败次数。");
-                            ui.label("协议探测：trojan/vless 已接入真实握手路径；其余协议当前仍以关键认证字段与握手前置条件检查为主。");
+                            ui.label("协议探测：trojan/vless、vmess TCP AEAD、hysteria2 已接入真实路径；tuic/hysteria 当前为 QUIC 连接尝试；REALITY/XTLS 当前会识别参数完整度并避免误判为普通 TLS 成功。");
                             ui.label("TLS：对 TLS 类协议执行 ClientHello 预检的结果；当前不等同于证书链、到期时间、域名匹配的完整审计。");
-                            ui.label("安全：综合协议、TLS、证书校验策略、稳定性、过GW/防追踪/现网稳定性画像得出的安全等级。");
+                            ui.label("安全：综合协议、TLS、证书校验策略、稳定性、GFW通过性/防追踪/现网稳定性画像与本地网络可达性得出的安全等级。");
                             ui.label("加密：根据协议和可见配置推断的加密强度。");
-                            ui.label("过GW：根据 TLS/REALITY、SNI、ALPN 与传输伪装评估穿透网关的适配度。");
+                            ui.label("GFW通过性：根据 TLS/REALITY、SNI、ALPN 与传输伪装评估穿透 GFW 的适配度。");
                             ui.label("防追踪：根据加密强度、证书校验、SNI/ALPN 完整性评估侧写风险。");
-                            ui.label("现网稳定性：综合持续稳定性窗口、TTFB、丢包、抖动与过GW/防追踪特征估计。");
+                            ui.label("本地网络可达性：根据当前本地网络下的 TCP 成功率、丢包、抖动、TTFB、UDP 与稳定性窗口计算 0~100 分。");
+                            ui.label("现网稳定性：综合持续稳定性窗口、TTFB、丢包、抖动与 GFW/防追踪特征估计。");
                             ui.label("本机私流：优先基于订阅 YAML 的 DNS、规则、TUN、控制口与局域网暴露配置评估本机流量泄露风险；若只有节点列表，则退化为启发式估计，当前未执行真实 DNS 泄露请求或抓包。");
                             ui.label("评分：节点表中的评分是单节点安全分；左侧“订阅综合”是按可用性、安全性、传输质量、现网稳定性和订阅整洁度聚合的订阅分。");
                             ui.label("状态：将 DNS/TCP/TLS 汇总后的最终判定与简要原因。");
@@ -1576,13 +1586,14 @@ impl eframe::App for ClashCheckerApp {
                             ui.add_space(8.0);
 
                             ui.heading("当前版本边界");
-                            ui.label("vmess AEAD、tuic、hysteria/hysteria2、REALITY 细化实握手仍在 TODO 中，当前未全部补齐。");
+                            ui.label("当前仍未补齐 tuic/hysteria 的应用层认证，以及 REALITY/XTLS 专用客户端路径；vmess TCP AEAD 与 hysteria2 应用层认证已接入。");
                             ui.label("证书链、到期时间、域名匹配、自签状态、TLS 版本与握手失败子类型当前尚未输出。");
                             ui.label("DNS 泄露与本机私网流量当前未做真实请求或抓包，只做启发式评估。");
                             ui.label("吞吐测试、出口 IP/ASN/地区、IPv4/IPv6、业务场景可达性当前尚未接入。");
                             ui.add_space(8.0);
 
                             ui.heading("常见疑问");
+                            ui.label("测试结果的优劣由您的本地网络环境直接关联，本程序最初目的也是测试某一订阅在当前网络环境下的优劣，推荐您购买各家代理服务商的最基础套餐进行测试。");
                             ui.label("“TLS 失败 (failed to fill whole buffer)” 通常不代表订阅链接有问题。");
                             ui.label("这更常见于节点服务端策略或预检方式兼容性导致的握手未返回完整响应。");
                             ui.label("如果 TCP 持续 3/3 成功，这个节点在真实客户端里仍可能可用。");
@@ -1760,11 +1771,22 @@ impl eframe::App for ClashCheckerApp {
                                     );
                                     detail_row(
                                         ui,
-                                        "过GW能力",
+                                        "本地网络可达性",
                                         &format!(
-                                            "{} | {}",
-                                            result.security.gateway_level.label(),
-                                            result.security.gateway_reason
+                                            "{} | {} 分 | {}",
+                                            result.security.local_network_level.label(),
+                                            result.security.local_network_score,
+                                            result.security.local_network_reason
+                                        ),
+                                    );
+                                    detail_row(
+                                        ui,
+                                        "GFW通过性",
+                                        &format!(
+                                            "{} | {} 分 | {}",
+                                            result.security.gfw_level.label(),
+                                            result.security.gfw_score,
+                                            result.security.gfw_reason
                                         ),
                                     );
                                     detail_row(
@@ -2221,10 +2243,14 @@ mod tests {
                 score: security_score,
                 security_reason: String::new(),
                 encryption_reason: String::new(),
-                gateway_level: SecurityLevel::High,
-                gateway_reason: String::new(),
+                gfw_level: SecurityLevel::High,
+                gfw_score: 88,
+                gfw_reason: String::new(),
                 anti_tracking_level: SecurityLevel::High,
                 anti_tracking_reason: String::new(),
+                local_network_level: SecurityLevel::High,
+                local_network_score: 90,
+                local_network_reason: String::new(),
                 live_network_level,
                 live_network_reason: String::new(),
                 note: String::new(),
@@ -2285,7 +2311,10 @@ mod tests {
         weak_result.tcp_successes = 0;
         weak_result.tcp_loss_percent = 100.0;
         weak_result.tcp_jitter_ms = None;
-        weak_result.security.gateway_level = SecurityLevel::Low;
+        weak_result.security.gfw_level = SecurityLevel::Low;
+        weak_result.security.gfw_score = 28;
+        weak_result.security.local_network_level = SecurityLevel::Low;
+        weak_result.security.local_network_score = 25;
         weak_result.security.anti_tracking_level = SecurityLevel::Low;
 
         let summary = StartSummary {

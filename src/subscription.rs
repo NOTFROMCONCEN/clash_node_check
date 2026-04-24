@@ -21,6 +21,9 @@ pub struct ProxyNode {
     pub security: Option<String>,
     pub alpn: Option<String>,
     pub udp: Option<bool>,
+    pub client_fingerprint: Option<String>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -128,6 +131,18 @@ struct ClashProxy {
     security: Option<String>,
     alpn: Option<StringOrList>,
     udp: Option<BoolValue>,
+    #[serde(rename = "client-fingerprint")]
+    client_fingerprint: Option<String>,
+    #[serde(rename = "reality-opts")]
+    reality_opts: Option<ClashRealityOpts>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClashRealityOpts {
+    #[serde(rename = "public-key")]
+    public_key: Option<String>,
+    #[serde(rename = "short-id")]
+    short_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +166,12 @@ struct VmessUriConfig {
     #[serde(rename = "allowInsecure")]
     skip_cert_verify: Option<BoolValue>,
     udp: Option<BoolValue>,
+    #[serde(rename = "fp", alias = "client-fingerprint")]
+    client_fingerprint: Option<String>,
+    #[serde(rename = "pbk", alias = "public-key")]
+    reality_public_key: Option<String>,
+    #[serde(rename = "sid", alias = "short-id")]
+    reality_short_id: Option<String>,
 }
 
 struct ParsedUriParts {
@@ -369,6 +390,15 @@ fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>, serde_yaml::Error> 
                 security: proxy.security,
                 alpn: proxy.alpn.and_then(|value| value.as_text()),
                 udp: proxy.udp.and_then(|value| value.as_bool()),
+                client_fingerprint: normalize_optional_string(proxy.client_fingerprint),
+                reality_public_key: proxy
+                    .reality_opts
+                    .as_ref()
+                    .and_then(|value| normalize_optional_string(value.public_key.clone())),
+                reality_short_id: proxy
+                    .reality_opts
+                    .as_ref()
+                    .and_then(|value| normalize_optional_string(value.short_id.clone())),
             })
         })
         .collect();
@@ -460,6 +490,9 @@ fn parse_vmess_uri(trimmed: &str, rest: &str) -> Option<ProxyNode> {
         security,
         alpn: config.alpn.and_then(|value| value.as_text()),
         udp: config.udp.and_then(|value| value.as_bool()),
+        client_fingerprint: normalize_optional_string(config.client_fingerprint),
+        reality_public_key: normalize_optional_string(config.reality_public_key),
+        reality_short_id: normalize_optional_string(config.reality_short_id),
     })
 }
 
@@ -490,6 +523,9 @@ fn parse_standard_uri_node(
         security: infer_security(&parts.query_map),
         alpn: infer_alpn(&parts.query_map),
         udp: infer_udp(&parts.query_map),
+        client_fingerprint: infer_client_fingerprint(&parts.query_map),
+        reality_public_key: infer_reality_public_key(&parts.query_map),
+        reality_short_id: infer_reality_short_id(&parts.query_map),
     })
 }
 
@@ -742,6 +778,36 @@ fn infer_udp(query_map: &HashMap<String, String>) -> Option<bool> {
     None
 }
 
+fn infer_client_fingerprint(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["client-fingerprint", "fingerprint", "fp"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_reality_public_key(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["public-key", "publickey", "pbk"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+fn infer_reality_short_id(query_map: &HashMap<String, String>) -> Option<String> {
+    let candidates = ["short-id", "shortid", "sid"];
+    for key in candidates {
+        if let Some(value) = query_map.get(key).filter(|value| !value.is_empty()) {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
 fn parse_bool_text(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -860,6 +926,21 @@ proxies:
         assert_eq!(nodes[0].tls, Some(true));
         assert_eq!(nodes[0].server_name.as_deref(), Some("tls.example.com"));
         assert_eq!(nodes[0].alpn.as_deref(), Some("h2"));
+    }
+
+    #[test]
+    fn parses_vless_reality_fields_from_uri() {
+        let nodes = parse_subscription(
+            "vless://550e8400-e29b-41d4-a716-446655440000@example.com:443?security=reality&sni=cdn.example.com&fp=chrome&pbk=demoPublicKey&sid=1a2b3c4d#REALITY",
+        )
+        .unwrap();
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_type, "vless");
+        assert_eq!(nodes[0].security.as_deref(), Some("reality"));
+        assert_eq!(nodes[0].client_fingerprint.as_deref(), Some("chrome"));
+        assert_eq!(nodes[0].reality_public_key.as_deref(), Some("demoPublicKey"));
+        assert_eq!(nodes[0].reality_short_id.as_deref(), Some("1a2b3c4d"));
     }
 
     #[test]

@@ -1,11 +1,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
+use md5::{Digest, Md5};
+use ring::aead::{Aad, AES_128_GCM, LessSafeKey, Nonce, UnboundKey};
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
@@ -163,10 +169,14 @@ pub struct SecurityAssessment {
     pub score: u8,
     pub security_reason: String,
     pub encryption_reason: String,
-    pub gateway_level: SecurityLevel,
-    pub gateway_reason: String,
+    pub gfw_level: SecurityLevel,
+    pub gfw_score: u8,
+    pub gfw_reason: String,
     pub anti_tracking_level: SecurityLevel,
     pub anti_tracking_reason: String,
+    pub local_network_level: SecurityLevel,
+    pub local_network_score: u8,
+    pub local_network_reason: String,
     pub live_network_level: SecurityLevel,
     pub live_network_reason: String,
     pub note: String,
@@ -411,7 +421,6 @@ fn check_node(
             tcp_probe,
             tls_probe,
             udp_probe,
-            ttfb_probe,
             stability,
         } => build_result(
             node,
@@ -420,7 +429,6 @@ fn check_node(
             tcp_probe,
             tls_probe,
             udp_probe,
-            ttfb_probe,
             stability,
             options.timeout,
             options.attempts.max(1),
@@ -446,7 +454,6 @@ enum EndpointProbeResult {
         tcp_probe: TcpProbe,
         tls_probe: TlsProbeStatusWithLatency,
         udp_probe: UdpProbeStatusWithLatency,
-        ttfb_probe: TtfbProbeStatusWithLatency,
         stability: StabilityMetrics,
     },
 }
@@ -470,7 +477,6 @@ fn collect_endpoint_probe(node: &ProxyNode, options: &CheckOptions) -> EndpointP
     let tcp_probe = run_tcp_probe(&socket_addrs, options.attempts.max(1), options.timeout);
     let tls_probe = run_tls_probe(node, &socket_addrs, options, tcp_probe.success_addr);
     let udp_probe = run_udp_probe(node, &socket_addrs, options.timeout, tcp_probe.success_addr);
-    let ttfb_probe = run_ttfb_probe(node, &socket_addrs, &tls_probe, options.timeout);
     let stability = run_stability_probe(
         &socket_addrs,
         options.timeout,
@@ -483,7 +489,6 @@ fn collect_endpoint_probe(node: &ProxyNode, options: &CheckOptions) -> EndpointP
         tcp_probe,
         tls_probe,
         udp_probe,
-        ttfb_probe,
         stability,
     }
 }
@@ -806,10 +811,14 @@ fn dns_failed(
             score: 0,
             security_reason: "无法评估：DNS失败".to_owned(),
             encryption_reason: "无法判断加密方式：DNS失败".to_owned(),
-            gateway_level: SecurityLevel::Unknown,
-            gateway_reason: "无法评估过GW能力：DNS失败".to_owned(),
+            gfw_level: SecurityLevel::Unknown,
+            gfw_score: 0,
+            gfw_reason: "无法评估 GFW 通过性：DNS失败".to_owned(),
             anti_tracking_level: SecurityLevel::Unknown,
             anti_tracking_reason: "无法评估防追踪：DNS失败".to_owned(),
+            local_network_level: SecurityLevel::Unknown,
+            local_network_score: 0,
+            local_network_reason: "无法评估本地网络可达性：DNS失败".to_owned(),
             live_network_level: SecurityLevel::Unknown,
             live_network_reason: "无法评估现网稳定性：DNS失败".to_owned(),
             note: "无法评估：DNS失败".to_owned(),
@@ -857,6 +866,22 @@ fn run_tcp_probe(socket_addrs: &[SocketAddr], attempts: u8, timeout: Duration) -
     probe
 }
 
+fn ordered_socket_addrs(
+    socket_addrs: &[SocketAddr],
+    prefer_addr: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut ordered_addrs = Vec::with_capacity(socket_addrs.len());
+    if let Some(addr) = prefer_addr {
+        ordered_addrs.push(addr);
+    }
+    for addr in socket_addrs {
+        if Some(*addr) != prefer_addr {
+            ordered_addrs.push(*addr);
+        }
+    }
+    ordered_addrs
+}
+
 fn run_tls_probe(
     node: &ProxyNode,
     socket_addrs: &[SocketAddr],
@@ -884,15 +909,7 @@ fn run_tls_probe(
         };
     }
 
-    let mut ordered_addrs = Vec::with_capacity(socket_addrs.len());
-    if let Some(addr) = prefer_addr {
-        ordered_addrs.push(addr);
-    }
-    for addr in socket_addrs {
-        if Some(*addr) != prefer_addr {
-            ordered_addrs.push(*addr);
-        }
-    }
+    let ordered_addrs = ordered_socket_addrs(socket_addrs, prefer_addr);
 
     let mut last_error = "TLS 握手失败".to_owned();
 
@@ -995,6 +1012,9 @@ struct TtfbProbeStatusWithLatency {
     latency_ms: Option<u128>,
 }
 
+const PROBE_TARGET_HOST: &str = "www.example.com";
+const PROBE_TARGET_PORT: u16 = 80;
+
 fn run_udp_probe(
     node: &ProxyNode,
     socket_addrs: &[SocketAddr],
@@ -1015,15 +1035,7 @@ fn run_udp_probe(
         };
     }
 
-    let mut ordered_addrs = Vec::with_capacity(socket_addrs.len());
-    if let Some(addr) = prefer_addr {
-        ordered_addrs.push(addr);
-    }
-    for addr in socket_addrs {
-        if Some(*addr) != prefer_addr {
-            ordered_addrs.push(*addr);
-        }
-    }
+    let ordered_addrs = ordered_socket_addrs(socket_addrs, prefer_addr);
 
     let mut last_error = String::new();
     let mut timeout_seen = false;
@@ -1101,7 +1113,18 @@ fn run_ttfb_probe(
     socket_addrs: &[SocketAddr],
     tls_probe: &TlsProbeStatusWithLatency,
     timeout: Duration,
+    prefer_addr: Option<SocketAddr>,
 ) -> TtfbProbeStatusWithLatency {
+    match node.node_type.to_ascii_lowercase().as_str() {
+        "trojan" => {
+            return run_trojan_proxy_ttfb(node, socket_addrs, timeout, tls_probe, prefer_addr)
+        }
+        "vless" => {
+            return run_vless_proxy_ttfb(node, socket_addrs, timeout, tls_probe, prefer_addr)
+        }
+        _ => {}
+    }
+
     if should_probe_tls(&node.node_type) {
         return match &tls_probe.status {
             TlsProbeStatus::Passed => TtfbProbeStatusWithLatency {
@@ -1134,8 +1157,8 @@ fn run_ttfb_probe(
     }
 
     let mut last_error = String::new();
-    for addr in socket_addrs {
-        match http_first_byte_probe(addr, &node.server, timeout) {
+    for addr in ordered_socket_addrs(socket_addrs, prefer_addr) {
+        match http_first_byte_probe(&addr, &node.server, timeout) {
             Ok(latency_ms) => {
                 return TtfbProbeStatusWithLatency {
                     status: TtfbProbeStatus::Passed("HTTP首包".to_owned()),
@@ -1156,6 +1179,188 @@ fn run_ttfb_probe(
         }),
         latency_ms: None,
     }
+}
+
+fn run_trojan_proxy_ttfb(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    tls_probe: &TlsProbeStatusWithLatency,
+    prefer_addr: Option<SocketAddr>,
+) -> TtfbProbeStatusWithLatency {
+    let Some(password) = node.password.as_deref() else {
+        return TtfbProbeStatusWithLatency {
+            status: TtfbProbeStatus::Failed("缺少 password".to_owned()),
+            latency_ms: None,
+        };
+    };
+
+    if !matches!(tls_probe.status, TlsProbeStatus::Passed) {
+        return TtfbProbeStatusWithLatency {
+            status: TtfbProbeStatus::Failed("Trojan 代理链TTFB依赖 TLS 通过".to_owned()),
+            latency_ms: None,
+        };
+    }
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(hex_sha224(password).as_bytes());
+    payload.extend_from_slice(b"\r\n");
+    payload.extend_from_slice(&build_trojan_connect_request(PROBE_TARGET_HOST, PROBE_TARGET_PORT));
+    payload.extend_from_slice(&build_proxy_http_request(PROBE_TARGET_HOST));
+
+    let mut last_error = String::new();
+    for socket_addr in ordered_socket_addrs(socket_addrs, prefer_addr) {
+        let started_at = Instant::now();
+        match tls_connect(node, &socket_addr, timeout) {
+            Ok(mut stream) => {
+                match read_first_byte_after_payload(
+                    &mut stream,
+                    &payload,
+                    "Trojan代理链HTTP首包",
+                    started_at,
+                ) {
+                    Ok(latency_ms) => {
+                        return TtfbProbeStatusWithLatency {
+                            status: TtfbProbeStatus::Passed("Trojan代理链HTTP首包".to_owned()),
+                            latency_ms: Some(latency_ms),
+                        }
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(error) => last_error = error,
+        }
+    }
+
+    TtfbProbeStatusWithLatency {
+        status: TtfbProbeStatus::Failed(if last_error.is_empty() {
+            "Trojan代理链TTFB失败".to_owned()
+        } else {
+            last_error
+        }),
+        latency_ms: None,
+    }
+}
+
+fn run_vless_proxy_ttfb(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    tls_probe: &TlsProbeStatusWithLatency,
+    prefer_addr: Option<SocketAddr>,
+) -> TtfbProbeStatusWithLatency {
+    if uses_reality_mode(node) {
+        return reality_ttfb_status(node);
+    }
+
+    let Some(uuid) = node.uuid.as_deref() else {
+        return TtfbProbeStatusWithLatency {
+            status: TtfbProbeStatus::Failed("缺少 uuid/id".to_owned()),
+            latency_ms: None,
+        };
+    };
+
+    let uuid_bytes = match parse_uuid_bytes(uuid) {
+        Some(bytes) => bytes,
+        None => {
+            return TtfbProbeStatusWithLatency {
+                status: TtfbProbeStatus::Failed("uuid/id 格式无效".to_owned()),
+                latency_ms: None,
+            }
+        }
+    };
+
+    let require_tls = vless_requires_tls(node);
+    if require_tls && !matches!(tls_probe.status, TlsProbeStatus::Passed) {
+        return TtfbProbeStatusWithLatency {
+            status: TtfbProbeStatus::Failed("VLESS 代理链TTFB依赖 TLS/REALITY 前置通过".to_owned()),
+            latency_ms: None,
+        };
+    }
+
+    let mut payload = build_vless_request(&uuid_bytes, PROBE_TARGET_HOST, PROBE_TARGET_PORT);
+    payload.extend_from_slice(&build_proxy_http_request(PROBE_TARGET_HOST));
+
+    let mut last_error = String::new();
+    for socket_addr in ordered_socket_addrs(socket_addrs, prefer_addr) {
+        let started_at = Instant::now();
+        if require_tls {
+            match tls_connect(node, &socket_addr, timeout) {
+                Ok(mut stream) => {
+                    match read_first_byte_after_payload(
+                        &mut stream,
+                        &payload,
+                        "VLESS代理链HTTP首包",
+                        started_at,
+                    ) {
+                        Ok(latency_ms) => {
+                            return TtfbProbeStatusWithLatency {
+                                status: TtfbProbeStatus::Passed("VLESS代理链HTTP首包".to_owned()),
+                                latency_ms: Some(latency_ms),
+                            }
+                        }
+                        Err(error) => last_error = error,
+                    }
+                }
+                Err(error) => last_error = error,
+            }
+        } else {
+            match TcpStream::connect_timeout(&socket_addr, timeout) {
+                Ok(mut stream) => {
+                    let _ = stream.set_read_timeout(Some(timeout));
+                    let _ = stream.set_write_timeout(Some(timeout));
+                    match read_first_byte_after_payload(
+                        &mut stream,
+                        &payload,
+                        "VLESS代理链HTTP首包",
+                        started_at,
+                    ) {
+                        Ok(latency_ms) => {
+                            return TtfbProbeStatusWithLatency {
+                                status: TtfbProbeStatus::Passed("VLESS代理链HTTP首包".to_owned()),
+                                latency_ms: Some(latency_ms),
+                            }
+                        }
+                        Err(error) => last_error = error,
+                    }
+                }
+                Err(error) => last_error = format!("VLESS TCP 连接失败: {error}"),
+            }
+        }
+    }
+
+    TtfbProbeStatusWithLatency {
+        status: TtfbProbeStatus::Failed(if last_error.is_empty() {
+            "VLESS代理链TTFB失败".to_owned()
+        } else {
+            last_error
+        }),
+        latency_ms: None,
+    }
+}
+
+fn build_proxy_http_request(host: &str) -> Vec<u8> {
+    format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").into_bytes()
+}
+
+fn read_first_byte_after_payload<T: Read + Write>(
+    stream: &mut T,
+    payload: &[u8],
+    label: &str,
+    started_at: Instant,
+) -> Result<u128, String> {
+    stream
+        .write_all(payload)
+        .map_err(|error| format!("{label}发送请求失败: {error}"))?;
+    stream
+        .flush()
+        .map_err(|error| format!("{label}刷新请求失败: {error}"))?;
+
+    let mut first_byte = [0_u8; 1];
+    stream
+        .read_exact(&mut first_byte)
+        .map_err(|error| format!("{label}读取首包失败: {error}"))?;
+    Ok(started_at.elapsed().as_millis())
 }
 
 fn http_first_byte_probe(
@@ -1255,7 +1460,6 @@ fn build_result(
     tcp_probe: TcpProbe,
     tls_probe: TlsProbeStatusWithLatency,
     udp_probe: UdpProbeStatusWithLatency,
-    ttfb_probe: TtfbProbeStatusWithLatency,
     stability: StabilityMetrics,
     timeout: Duration,
     attempts: u8,
@@ -1263,6 +1467,13 @@ fn build_result(
     let tcp_avg_latency_ms = average(&tcp_probe.latencies_ms);
     let tcp_jitter_ms = jitter(&tcp_probe.latencies_ms);
     let tcp_loss_percent = loss_percent(tcp_probe.successes, attempts as usize);
+    let ttfb_probe = run_ttfb_probe(
+        &node,
+        socket_addrs,
+        &tls_probe,
+        timeout,
+        tcp_probe.success_addr,
+    );
     let tcp_ok = tcp_probe.successes > 0;
     let protocol_probe = run_protocol_probe(
         &node,
@@ -1271,6 +1482,7 @@ fn build_result(
         &tls_probe.status,
         tcp_probe.successes,
         attempts,
+        tcp_probe.success_addr,
     );
     let protocol_name = node.node_type.to_ascii_lowercase();
     let udp_is_required = is_udp_required_protocol(&protocol_name);
@@ -1495,7 +1707,7 @@ fn run_trojan_real_probe(
     let mut payload = Vec::new();
     payload.extend_from_slice(hex_sha224(password).as_bytes());
     payload.extend_from_slice(b"\r\n");
-    payload.extend_from_slice(&build_trojan_connect_request());
+    payload.extend_from_slice(&build_trojan_connect_request(PROBE_TARGET_HOST, PROBE_TARGET_PORT));
 
     let mut last_error = String::new();
     for socket_addr in socket_addrs {
@@ -1548,6 +1760,10 @@ fn run_vless_real_probe(
     timeout: Duration,
     tls_status: &TlsProbeStatus,
 ) -> ProtocolProbeStatus {
+    if uses_reality_mode(node) {
+        return reality_protocol_probe_status(node);
+    }
+
     let Some(uuid) = node.uuid.as_deref() else {
         return ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned());
     };
@@ -1562,7 +1778,7 @@ fn run_vless_real_probe(
         return ProtocolProbeStatus::Partial("TLS/REALITY要求未满足".to_owned());
     }
 
-    let request = build_vless_request(&uuid_bytes);
+    let request = build_vless_request(&uuid_bytes, PROBE_TARGET_HOST, PROBE_TARGET_PORT);
     let mut last_error = String::new();
 
     for socket_addr in socket_addrs {
@@ -1595,24 +1811,494 @@ fn run_vless_real_probe(
     })
 }
 
-fn run_vmess_probe(node: &ProxyNode, tls_status: &TlsProbeStatus) -> ProtocolProbeStatus {
+fn run_vmess_probe(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    tls_status: &TlsProbeStatus,
+) -> ProtocolProbeStatus {
     if node.uuid.is_none() {
         return ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned());
-    }
-
-    if node
-        .security
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("none"))
-    {
-        return ProtocolProbeStatus::Partial("security=none".to_owned());
     }
 
     if node.tls == Some(true) && !matches!(tls_status, TlsProbeStatus::Passed) {
         return ProtocolProbeStatus::Partial("TLS要求未满足".to_owned());
     }
 
-    ProtocolProbeStatus::Partial("VMess AEAD 真实握手待实现".to_owned())
+    let network = node
+        .network
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "tcp".to_owned());
+    if !matches!(network.as_str(), "tcp" | "") {
+        return ProtocolProbeStatus::Partial(format!(
+            "当前仅实现 VMess TCP AEAD 真实握手，暂不支持 {} 传输",
+            if network.is_empty() { "默认" } else { network.as_str() }
+        ));
+    }
+
+    let cipher_method = match vmess_request_cipher_method(node) {
+        Ok(method) => method,
+        Err(error) => return ProtocolProbeStatus::Partial(error),
+    };
+
+    let request = match build_vmess_aead_request(node, PROBE_TARGET_HOST, PROBE_TARGET_PORT, cipher_method) {
+        Ok(request) => request,
+        Err(error) => return ProtocolProbeStatus::Failed(error),
+    };
+
+    let mut last_error = String::new();
+    for socket_addr in socket_addrs {
+        let outcome = if node.tls == Some(true) {
+            match tls_connect(node, socket_addr, timeout) {
+                Ok(mut stream) => send_and_expect_open(&mut stream, &request, "VMess AEAD"),
+                Err(error) => Err(error),
+            }
+        } else {
+            match TcpStream::connect_timeout(socket_addr, timeout) {
+                Ok(mut stream) => {
+                    let _ = stream.set_read_timeout(Some(timeout));
+                    let _ = stream.set_write_timeout(Some(timeout));
+                    send_and_expect_open(&mut stream, &request, "VMess AEAD")
+                }
+                Err(error) => Err(error.to_string()),
+            }
+        };
+
+        match outcome {
+            Ok(message) => return ProtocolProbeStatus::Passed(message),
+            Err(error) => last_error = error,
+        }
+    }
+
+    ProtocolProbeStatus::Failed(if last_error.is_empty() {
+        "VMess AEAD 真实握手失败".to_owned()
+    } else {
+        last_error
+    })
+}
+
+fn run_hysteria2_auth_probe(node: &ProxyNode, timeout: Duration) -> ProtocolProbeStatus {
+    let Some(auth) = node.password.as_deref().filter(|value| !value.trim().is_empty()) else {
+        return ProtocolProbeStatus::Failed("缺少 Hysteria2 auth/password".to_owned());
+    };
+
+    let server_name = node
+        .server_name
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| node.server.clone());
+    let config = hysteria2::config::Config {
+        auth: auth.to_owned(),
+        server_addr: format!("{}:{}", node.server, node.port),
+        server_name,
+        insecure: node.skip_cert_verify.unwrap_or(false),
+        port_hopping_range: None,
+    };
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return ProtocolProbeStatus::Failed(format!("创建 Hysteria2 运行时失败: {error}"));
+        }
+    };
+
+    let outcome = runtime.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let client = hysteria2::connect(&config)
+            .await
+            .map_err(|error| format!("Hysteria2 认证失败: {error}"))?;
+        let mut stream = client
+            .tcp_connect(format!("{}:{}", PROBE_TARGET_HOST, PROBE_TARGET_PORT))
+            .await
+            .map_err(|error| format!("Hysteria2 打开代理 TCP 失败: {error}"))?;
+
+        stream
+            .write_all(&build_proxy_http_request(PROBE_TARGET_HOST))
+            .await
+            .map_err(|error| format!("Hysteria2 发送代理请求失败: {error}"))?;
+        stream
+            .flush()
+            .await
+            .map_err(|error| format!("Hysteria2 刷新代理请求失败: {error}"))?;
+
+        let mut one_byte = [0_u8; 1];
+        match tokio::time::timeout(timeout, stream.read(&mut one_byte)).await {
+            Ok(Ok(0)) => Err("Hysteria2 认证后连接被关闭".to_owned()),
+            Ok(Ok(_)) => Ok("Hysteria2 应用层认证成功(收到响应)".to_owned()),
+            Ok(Err(error)) => Err(format!("Hysteria2 读取响应失败: {error}")),
+            Err(_) => Ok("Hysteria2 应用层认证成功(写入后连接保持)".to_owned()),
+        }
+    });
+
+    match outcome {
+        Ok(message) => ProtocolProbeStatus::Passed(message),
+        Err(error) => ProtocolProbeStatus::Failed(error),
+    }
+}
+
+fn run_tuic_auth_probe(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    prefer_addr: Option<SocketAddr>,
+) -> ProtocolProbeStatus {
+    let Some(uuid) = node.uuid.as_deref() else {
+        return ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned());
+    };
+    let Some(password) = node.password.as_deref().filter(|value| !value.trim().is_empty()) else {
+        return ProtocolProbeStatus::Failed("缺少 password".to_owned());
+    };
+    let uuid_bytes = match parse_uuid_bytes(uuid) {
+        Some(bytes) => bytes,
+        None => return ProtocolProbeStatus::Failed("uuid/id 格式无效".to_owned()),
+    };
+    let server_name = match quic_server_name(node) {
+        Ok(value) => value,
+        Err(error) => return ProtocolProbeStatus::Failed(error),
+    };
+    let alpn_candidates = quic_alpn_candidates(node);
+    if alpn_candidates.is_empty() {
+        return ProtocolProbeStatus::Failed("缺少可用 ALPN".to_owned());
+    }
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return ProtocolProbeStatus::Failed(format!("创建 TUIC 运行时失败: {error}"));
+        }
+    };
+
+    let ordered_addrs = ordered_socket_addrs(socket_addrs, prefer_addr);
+    let mut last_error = String::new();
+    for alpn in alpn_candidates {
+        for socket_addr in &ordered_addrs {
+            match runtime.block_on(run_tuic_auth_probe_once(
+                node,
+                *socket_addr,
+                &server_name,
+                &alpn,
+                timeout,
+                &uuid_bytes,
+                password.as_bytes(),
+            )) {
+                Ok(message) => return ProtocolProbeStatus::Passed(format!("{message}(ALPN {alpn})")),
+                Err(error) => last_error = format!("ALPN {alpn}: {error}"),
+            }
+        }
+    }
+
+    ProtocolProbeStatus::Failed(if last_error.is_empty() {
+        "TUIC 应用层认证失败".to_owned()
+    } else {
+        last_error
+    })
+}
+
+async fn run_tuic_auth_probe_once(
+    node: &ProxyNode,
+    socket_addr: SocketAddr,
+    server_name: &str,
+    alpn: &str,
+    timeout: Duration,
+    uuid: &[u8; 16],
+    password: &[u8],
+) -> Result<String, String> {
+    let (_endpoint, connection) = connect_quic_session(node, socket_addr, server_name, alpn, timeout)
+        .await?;
+
+    let mut token = [0_u8; 32];
+    connection
+        .export_keying_material(&mut token, uuid, password)
+        .map_err(|error| format!("导出 TUIC 认证材料失败: {error:?}"))?;
+
+    let mut auth_stream = connection
+        .open_uni()
+        .await
+        .map_err(|error| format!("打开 TUIC 认证流失败: {error}"))?;
+    auth_stream
+        .write_all(&build_tuic_auth_command(uuid, &token))
+        .await
+        .map_err(|error| format!("发送 TUIC 认证命令失败: {error}"))?;
+    auth_stream
+        .finish()
+        .map_err(|error| format!("结束 TUIC 认证流失败: {error}"))?;
+
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|error| format!("打开 TUIC TCP 中继流失败: {error}"))?;
+    let connect_request = build_tuic_connect_request(PROBE_TARGET_HOST, PROBE_TARGET_PORT)?;
+    send.write_all(&connect_request)
+        .await
+        .map_err(|error| format!("发送 TUIC Connect 命令失败: {error}"))?;
+    send.write_all(&build_proxy_http_request(PROBE_TARGET_HOST))
+        .await
+        .map_err(|error| format!("发送 TUIC 代理请求失败: {error}"))?;
+    send.finish()
+        .map_err(|error| format!("结束 TUIC 代理写入失败: {error}"))?;
+
+    let mut one_byte = [0_u8; 1];
+    let result = match tokio::time::timeout(timeout, recv.read(&mut one_byte)).await {
+        Ok(Ok(Some(_))) => Ok("TUIC 应用层认证成功(收到响应)".to_owned()),
+        Ok(Ok(None)) => Err("TUIC 认证后连接被关闭".to_owned()),
+        Ok(Err(error)) => Err(format!("TUIC 读取响应失败: {error}")),
+        Err(_) => Ok("TUIC 应用层认证成功(写入后连接保持)".to_owned()),
+    };
+    connection.close(0u32.into(), b"probe");
+    result
+}
+
+fn build_tuic_auth_command(uuid: &[u8; 16], token: &[u8; 32]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(2 + 16 + 32);
+    payload.push(0x05);
+    payload.push(0x00);
+    payload.extend_from_slice(uuid);
+    payload.extend_from_slice(token);
+    payload
+}
+
+fn build_tuic_connect_request(target_host: &str, target_port: u16) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::with_capacity(2 + target_host.len() + 4);
+    payload.push(0x05);
+    payload.push(0x01);
+    payload.extend_from_slice(&build_tuic_address(target_host, target_port)?);
+    Ok(payload)
+}
+
+fn build_tuic_address(target_host: &str, target_port: u16) -> Result<Vec<u8>, String> {
+    if let Ok(ipv4) = target_host.parse::<Ipv4Addr>() {
+        let mut encoded = Vec::with_capacity(1 + 4 + 2);
+        encoded.push(0x01);
+        encoded.extend_from_slice(&ipv4.octets());
+        encoded.extend_from_slice(&target_port.to_be_bytes());
+        return Ok(encoded);
+    }
+
+    if let Ok(ipv6) = target_host.parse::<Ipv6Addr>() {
+        let mut encoded = Vec::with_capacity(1 + 16 + 2);
+        encoded.push(0x02);
+        encoded.extend_from_slice(&ipv6.octets());
+        encoded.extend_from_slice(&target_port.to_be_bytes());
+        return Ok(encoded);
+    }
+
+    let host = target_host.as_bytes();
+    if host.len() > u8::MAX as usize {
+        return Err("TUIC 目标域名过长".to_owned());
+    }
+
+    let mut encoded = Vec::with_capacity(1 + 1 + host.len() + 2);
+    encoded.push(0x00);
+    encoded.push(host.len() as u8);
+    encoded.extend_from_slice(host);
+    encoded.extend_from_slice(&target_port.to_be_bytes());
+    Ok(encoded)
+}
+
+fn vmess_request_cipher_method(node: &ProxyNode) -> Result<u8, String> {
+    let cipher = node
+        .cipher
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "auto".to_owned());
+    match cipher.as_str() {
+        "" | "auto" | "chacha20-poly1305" | "chacha20-ietf-poly1305" => Ok(0x04),
+        "aes-128-gcm" => Ok(0x03),
+        "none" => Ok(0x05),
+        other => Err(format!("当前未实现 VMess 数据加密算法 {other} 的 AEAD 握手")),
+    }
+}
+
+fn build_vmess_aead_request(
+    node: &ProxyNode,
+    target_host: &str,
+    target_port: u16,
+    cipher_method: u8,
+) -> Result<Vec<u8>, String> {
+    let uuid = node.uuid.as_deref().ok_or_else(|| "缺少 uuid/id".to_owned())?;
+    let uuid_bytes = parse_uuid_bytes(uuid).ok_or_else(|| "uuid/id 格式无效".to_owned())?;
+    let instruction_key = vmess_instruction_key(&uuid_bytes);
+
+    let random = SystemRandom::new();
+    let auth_id = vmess_auth_id(&instruction_key, &random)?;
+
+    let mut nonce = [0_u8; 8];
+    random
+        .fill(&mut nonce)
+        .map_err(|_| "生成 VMess AEAD nonce 失败".to_owned())?;
+
+    let mut header = Vec::with_capacity(64);
+    header.push(0x01);
+
+    let mut request_iv = [0_u8; 16];
+    random
+        .fill(&mut request_iv)
+        .map_err(|_| "生成 VMess Request IV 失败".to_owned())?;
+    header.extend_from_slice(&request_iv);
+
+    let mut request_key = [0_u8; 16];
+    random
+        .fill(&mut request_key)
+        .map_err(|_| "生成 VMess Request Key 失败".to_owned())?;
+    header.extend_from_slice(&request_key);
+
+    let mut response_auth_v = [0_u8; 1];
+    random
+        .fill(&mut response_auth_v)
+        .map_err(|_| "生成 VMess Response Auth V 失败".to_owned())?;
+    header.push(response_auth_v[0]);
+
+    header.push(0x01);
+    header.push(cipher_method);
+    header.push(0x00);
+    header.push(0x01);
+    header.extend_from_slice(&target_port.to_be_bytes());
+
+    if let Ok(ipv4) = target_host.parse::<Ipv4Addr>() {
+        header.push(0x01);
+        header.extend_from_slice(&ipv4.octets());
+    } else if let Ok(ipv6) = target_host.parse::<Ipv6Addr>() {
+        header.push(0x03);
+        header.extend_from_slice(&ipv6.octets());
+    } else {
+        let host = target_host.as_bytes();
+        if host.len() > u8::MAX as usize {
+            return Err("VMess 目标域名过长".to_owned());
+        }
+        header.push(0x02);
+        header.push(host.len() as u8);
+        header.extend_from_slice(host);
+    }
+
+    let checksum = vmess_fnv1a(&header).to_be_bytes();
+    header.extend_from_slice(&checksum);
+
+    let encrypted_length = vmess_encrypt_aead_length(&instruction_key, &auth_id, &nonce, header.len() as u16)?;
+    let encrypted_header = vmess_encrypt_aead_header(&instruction_key, &auth_id, &nonce, &header)?;
+
+    let mut request = Vec::with_capacity(16 + encrypted_length.len() + nonce.len() + encrypted_header.len());
+    request.extend_from_slice(&auth_id);
+    request.extend_from_slice(&encrypted_length);
+    request.extend_from_slice(&nonce);
+    request.extend_from_slice(&encrypted_header);
+    Ok(request)
+}
+
+fn vmess_instruction_key(uuid: &[u8; 16]) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(uuid);
+    hasher.update(b"c48619fe-8f02-49e0-b9e9-edf763e17e21");
+    let digest = hasher.finalize();
+    let mut key = [0_u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
+}
+
+fn vmess_auth_id(instruction_key: &[u8; 16], random: &SystemRandom) -> Result<[u8; 16], String> {
+    let mut plain = [0_u8; 16];
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    plain[..8].copy_from_slice(&now.to_be_bytes());
+    random
+        .fill(&mut plain[8..12])
+        .map_err(|_| "生成 VMess Auth ID 随机段失败".to_owned())?;
+    let checksum = crc32fast::hash(&plain[..12]).to_be_bytes();
+    plain[12..16].copy_from_slice(&checksum);
+
+    let auth_key = vmess_kdf(instruction_key, &[b"AES Auth ID Encryption"]);
+    let cipher = Aes128::new_from_slice(&auth_key[..16])
+        .map_err(|_| "构建 VMess Auth ID 密钥失败".to_owned())?;
+    let mut block = aes::cipher::generic_array::GenericArray::clone_from_slice(&plain);
+    cipher.encrypt_block(&mut block);
+    Ok(block.into())
+}
+
+fn vmess_encrypt_aead_length(
+    instruction_key: &[u8; 16],
+    auth_id: &[u8; 16],
+    nonce: &[u8; 8],
+    header_len: u16,
+) -> Result<Vec<u8>, String> {
+    let key = vmess_kdf(
+        instruction_key,
+        &[b"VMess Header AEAD Key_Length", auth_id, nonce],
+    );
+    let nonce_bytes = vmess_kdf(
+        instruction_key,
+        &[b"VMess Header AEAD Nonce_Length", auth_id, nonce],
+    );
+    vmess_seal_aes128_gcm(
+        &key[..16],
+        &nonce_bytes[..12],
+        auth_id,
+        &header_len.to_be_bytes(),
+    )
+}
+
+fn vmess_encrypt_aead_header(
+    instruction_key: &[u8; 16],
+    auth_id: &[u8; 16],
+    nonce: &[u8; 8],
+    header: &[u8],
+) -> Result<Vec<u8>, String> {
+    let key = vmess_kdf(instruction_key, &[b"VMess Header AEAD Key", auth_id, nonce]);
+    let nonce_bytes = vmess_kdf(
+        instruction_key,
+        &[b"VMess Header AEAD Nonce", auth_id, nonce],
+    );
+    vmess_seal_aes128_gcm(&key[..16], &nonce_bytes[..12], auth_id, header)
+}
+
+fn vmess_seal_aes128_gcm(
+    key_bytes: &[u8],
+    nonce_bytes: &[u8],
+    aad_bytes: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let unbound_key = UnboundKey::new(&AES_128_GCM, key_bytes)
+        .map_err(|_| "构建 VMess AES-128-GCM 密钥失败".to_owned())?;
+    let key = LessSafeKey::new(unbound_key);
+    let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)
+        .map_err(|_| "构建 VMess AEAD nonce 失败".to_owned())?;
+    let mut output = plaintext.to_vec();
+    key.seal_in_place_append_tag(nonce, Aad::from(aad_bytes), &mut output)
+        .map_err(|_| "VMess AEAD 加密失败".to_owned())?;
+    Ok(output)
+}
+
+fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
+    let mut current_key = b"VMess AEAD KDF".to_vec();
+    for path_item in path {
+        current_key = vmess_hmac_sha256(&current_key, path_item).to_vec();
+    }
+    vmess_hmac_sha256(&current_key, key)
+}
+
+fn vmess_hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let signing_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let tag = hmac::sign(&signing_key, data);
+    let mut output = [0_u8; 32];
+    output.copy_from_slice(tag.as_ref());
+    output
+}
+
+fn vmess_fnv1a(data: &[u8]) -> u32 {
+    let mut hash = 0x811c9dc5_u32;
+    for byte in data {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn vless_requires_tls(node: &ProxyNode) -> bool {
@@ -1626,6 +2312,82 @@ fn vless_requires_tls(node: &ProxyNode) -> bool {
         );
     }
     false
+}
+
+fn reality_protocol_probe_status(node: &ProxyNode) -> ProtocolProbeStatus {
+    if let Some(message) = reality_config_error(node) {
+        return ProtocolProbeStatus::Failed(message);
+    }
+
+    let mode = if node
+        .security
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("reality"))
+    {
+        "REALITY"
+    } else {
+        "XTLS Vision/REALITY"
+    };
+
+    ProtocolProbeStatus::Skipped(format!(
+        "{} 参数已识别，但当前未实现 Xray/sing-box 级专用客户端握手，已避免误判为普通 TLS 成功",
+        mode
+    ))
+}
+
+fn reality_ttfb_status(node: &ProxyNode) -> TtfbProbeStatusWithLatency {
+    let status = if let Some(message) = reality_config_error(node) {
+        TtfbProbeStatus::Failed(message)
+    } else {
+        TtfbProbeStatus::Skipped(
+            "REALITY/XTLS Vision 代理链 TTFB 需专用客户端，当前不再复用普通 TLS 基线"
+                .to_owned(),
+        )
+    };
+
+    TtfbProbeStatusWithLatency {
+        status,
+        latency_ms: None,
+    }
+}
+
+fn reality_config_error(node: &ProxyNode) -> Option<String> {
+    let mut missing = Vec::new();
+
+    if node
+        .client_fingerprint
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        missing.push("client-fingerprint/fp");
+    }
+
+    let is_reality = node
+        .security
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("reality"));
+    if is_reality {
+        if node
+            .reality_public_key
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            missing.push("public-key/pbk");
+        }
+        if node
+            .reality_short_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            missing.push("short-id/sid");
+        }
+    }
+
+    if missing.is_empty() {
+        None
+    } else {
+        Some(format!("REALITY 参数不完整，缺少 {}", missing.join("、")))
+    }
 }
 
 fn send_and_expect_open<T: Read + Write>(
@@ -1651,26 +2413,26 @@ fn send_and_expect_open<T: Read + Write>(
     }
 }
 
-fn build_trojan_connect_request() -> Vec<u8> {
+fn build_trojan_connect_request(target_host: &str, target_port: u16) -> Vec<u8> {
     let mut request = Vec::with_capacity(32);
-    let host = b"www.example.com";
+    let host = target_host.as_bytes();
     request.push(0x01);
     request.push(0x03);
     request.push(host.len() as u8);
     request.extend_from_slice(host);
-    request.extend_from_slice(&80_u16.to_be_bytes());
+    request.extend_from_slice(&target_port.to_be_bytes());
     request.extend_from_slice(b"\r\n");
     request
 }
 
-fn build_vless_request(uuid: &[u8; 16]) -> Vec<u8> {
+fn build_vless_request(uuid: &[u8; 16], target_host: &str, target_port: u16) -> Vec<u8> {
     let mut request = Vec::with_capacity(64);
-    let host = b"www.example.com";
+    let host = target_host.as_bytes();
     request.push(0x00);
     request.extend_from_slice(uuid);
     request.push(0x00);
     request.push(0x01);
-    request.extend_from_slice(&80_u16.to_be_bytes());
+    request.extend_from_slice(&target_port.to_be_bytes());
     request.push(0x02);
     request.push(host.len() as u8);
     request.extend_from_slice(host);
@@ -1819,6 +2581,7 @@ fn run_protocol_probe(
     tls_status: &TlsProbeStatus,
     tcp_successes: usize,
     attempts: u8,
+    prefer_addr: Option<SocketAddr>,
 ) -> ProtocolProbeStatus {
     let protocol = node.node_type.to_ascii_lowercase();
 
@@ -1833,31 +2596,178 @@ fn run_protocol_probe(
     match protocol.as_str() {
         "trojan" => run_trojan_real_probe(node, socket_addrs, timeout, tls_status),
         "vless" => run_vless_real_probe(node, socket_addrs, timeout, tls_status),
-        "vmess" => run_vmess_probe(node, tls_status),
+        "vmess" => run_vmess_probe(node, socket_addrs, timeout, tls_status),
         "tuic" => {
             if node.uuid.is_none() || node.password.is_none() {
                 ProtocolProbeStatus::Failed("缺少 uuid/password".to_owned())
             } else if node.udp == Some(false) {
                 ProtocolProbeStatus::Failed("UDP被禁用".to_owned())
-            } else if node.alpn.is_none() {
-                ProtocolProbeStatus::Partial("建议配置 ALPN".to_owned())
             } else {
-                ProtocolProbeStatus::Partial("已验证UDP，QUIC真实握手待实现".to_owned())
+                run_tuic_auth_probe(node, socket_addrs, timeout, prefer_addr)
             }
         }
-        "hysteria" | "hysteria2" => {
+        "hysteria2" => {
+            if node.password.is_none() {
+                ProtocolProbeStatus::Failed("缺少认证字段".to_owned())
+            } else if node.udp == Some(false) {
+                ProtocolProbeStatus::Failed("UDP被禁用".to_owned())
+            } else {
+                run_hysteria2_auth_probe(node, timeout)
+            }
+        }
+        "hysteria" => {
             if node.password.is_none() && node.uuid.is_none() {
                 ProtocolProbeStatus::Failed("缺少认证字段".to_owned())
             } else if node.udp == Some(false) {
                 ProtocolProbeStatus::Failed("UDP被禁用".to_owned())
-            } else if node.alpn.is_none() {
-                ProtocolProbeStatus::Partial("建议配置 ALPN".to_owned())
             } else {
-                ProtocolProbeStatus::Partial("已验证UDP，QUIC真实握手待实现".to_owned())
+                match run_quic_transport_probe(node, socket_addrs, timeout, prefer_addr) {
+                    Ok(message) => ProtocolProbeStatus::Partial(format!(
+                        "{message}；Hysteria v1 应用层认证仍依赖自定义客户端协议栈，当前先保留为传输层通过"
+                    )),
+                    Err(error) => ProtocolProbeStatus::Partial(format!("QUIC传输未建立：{error}")),
+                }
             }
         }
         _ => ProtocolProbeStatus::Skipped("该协议未配置握手探测".to_owned()),
     }
+}
+
+fn run_quic_transport_probe(
+    node: &ProxyNode,
+    socket_addrs: &[SocketAddr],
+    timeout: Duration,
+    prefer_addr: Option<SocketAddr>,
+) -> Result<String, String> {
+    let server_name = quic_server_name(node)?;
+    let alpn_candidates = quic_alpn_candidates(node);
+    if alpn_candidates.is_empty() {
+        return Err("缺少可用 ALPN".to_owned());
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("创建 QUIC 运行时失败: {error}"))?;
+
+    let ordered_addrs = ordered_socket_addrs(socket_addrs, prefer_addr);
+    let mut last_error = String::new();
+    for alpn in alpn_candidates {
+        for socket_addr in &ordered_addrs {
+            match runtime.block_on(connect_quic_transport(
+                node,
+                *socket_addr,
+                &server_name,
+                &alpn,
+                timeout,
+            )) {
+                Ok(()) => return Ok(format!("QUIC握手成功(ALPN {alpn})")),
+                Err(error) => last_error = format!("ALPN {alpn}: {error}"),
+            }
+        }
+    }
+
+    Err(if last_error.is_empty() {
+        "QUIC握手失败".to_owned()
+    } else {
+        last_error
+    })
+}
+
+async fn connect_quic_transport(
+    node: &ProxyNode,
+    socket_addr: SocketAddr,
+    server_name: &str,
+    alpn: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (_endpoint, connection) = connect_quic_session(node, socket_addr, server_name, alpn, timeout)
+        .await?;
+    connection.close(0u32.into(), b"probe");
+    Ok(())
+}
+
+async fn connect_quic_session(
+    node: &ProxyNode,
+    socket_addr: SocketAddr,
+    server_name: &str,
+    alpn: &str,
+    timeout: Duration,
+) -> Result<(quinn::Endpoint, quinn::Connection), String> {
+    let bind_addr = if socket_addr.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+
+    let mut endpoint = quinn::Endpoint::client(bind_addr)
+        .map_err(|error| format!("绑定 QUIC 端点失败: {error}"))?;
+    endpoint.set_default_client_config(build_quic_client_config(node, alpn)?);
+
+    let connecting = endpoint
+        .connect(socket_addr, server_name)
+        .map_err(|error| format!("创建 QUIC 连接失败: {error}"))?;
+    let connection = tokio::time::timeout(timeout, connecting)
+        .await
+        .map_err(|_| format!("QUIC握手超时({}ms)", timeout.as_millis()))?
+        .map_err(|error| format!("QUIC握手失败: {error}"))?;
+    Ok((endpoint, connection))
+}
+
+fn build_quic_client_config(node: &ProxyNode, alpn: &str) -> Result<quinn::ClientConfig, String> {
+    let mut tls_config = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(InsecureTlsVerifier))
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![alpn.as_bytes().to_vec()];
+    if node.skip_cert_verify == Some(false) {
+        tls_config.enable_sni = true;
+    }
+
+    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|error| format!("构建 QUIC TLS 配置失败: {error}"))?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+    client_config.transport_config(Arc::new(quinn::TransportConfig::default()));
+    Ok(client_config)
+}
+
+fn quic_server_name(node: &ProxyNode) -> Result<String, String> {
+    if let Some(server_name) = node.server_name.as_deref() {
+        if !server_name.trim().is_empty() {
+            return Ok(server_name.trim().to_owned());
+        }
+    }
+
+    if node.server.parse::<IpAddr>().is_ok() {
+        return Err("缺少 SNI/ServerName".to_owned());
+    }
+
+    Ok(node.server.trim().to_owned())
+}
+
+fn quic_alpn_candidates(node: &ProxyNode) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(alpn) = node.alpn.as_deref() {
+        for part in alpn.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() && !values.iter().any(|item| item == trimmed) {
+                values.push(trimmed.to_owned());
+            }
+        }
+    }
+
+    if values.is_empty() {
+        match node.node_type.to_ascii_lowercase().as_str() {
+            "tuic" | "hysteria2" => values.push("h3".to_owned()),
+            "hysteria" => {
+                values.push("hysteria".to_owned());
+                values.push("h3".to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    values
 }
 
 fn should_probe_tls(node_type: &str) -> bool {
@@ -1972,20 +2882,32 @@ fn assess_security(
         }
     };
     let stability_score = stability_security_score(stability, &mut security_notes);
-    let (gateway_level, gateway_reason) = assess_gateway_profile(node, &protocol, tls_status);
+    let (gfw_level, gfw_score, gfw_reason) = assess_gfw_profile(node, &protocol, tls_status);
     let (anti_tracking_level, anti_tracking_reason) =
         assess_anti_tracking_profile(node, &protocol, tls_status, &encryption_level);
+    let (local_network_level, local_network_score, local_network_reason) =
+        assess_local_network_profile(
+            &protocol,
+            udp_status,
+            ttfb_status,
+            ttfb_ms,
+            tcp_success_rate,
+            tcp_loss_percent,
+            tcp_jitter_ms,
+            stability,
+            attempts,
+        );
     let (live_network_level, live_network_reason) = assess_live_network_profile(
         stability,
         ttfb_status,
         ttfb_ms,
         tcp_loss_percent,
         tcp_jitter_ms,
-        &gateway_level,
+        &gfw_level,
         &anti_tracking_level,
     );
 
-    let mut score = encryption_score
+    let mut base_score = encryption_score
         .saturating_add(transport_score)
         .saturating_add(tls_score)
         .saturating_add(udp_score)
@@ -1995,9 +2917,14 @@ fn assess_security(
         .saturating_add(loss_score)
         .saturating_add(jitter_score)
         .saturating_add(stability_score);
-    if score > 100 {
-        score = 100;
+    if base_score > 100 {
+        base_score = 100;
     }
+
+    let score = (((u16::from(base_score) * 70)
+        + (u16::from(gfw_score) * 15)
+        + (u16::from(local_network_score) * 15))
+        / 100) as u8;
 
     let security_level = if protocol == "unknown" {
         SecurityLevel::Unknown
@@ -2012,15 +2939,26 @@ fn assess_security(
     let encryption_reason = join_notes(&encryption_notes);
     let security_reason = join_notes(&[
         protocol_security_baseline_reason(node, &protocol, tls_status),
-        gateway_reason.clone(),
+        format!("GFW 通过性 {} 分：{}", gfw_score, gfw_reason),
+        format!(
+            "本地网络可达性 {} 分：{}",
+            local_network_score, local_network_reason
+        ),
         anti_tracking_reason.clone(),
         live_network_reason.clone(),
     ]);
     let mut notes = Vec::new();
     append_notes(&mut notes, &encryption_notes);
     append_notes(&mut notes, &security_notes);
-    push_note(&mut notes, format!("过GW评估：{}", gateway_reason));
+    push_note(&mut notes, format!("GFW通过性评估：{} 分，{}", gfw_score, gfw_reason));
     push_note(&mut notes, format!("防追踪评估：{}", anti_tracking_reason));
+    push_note(
+        &mut notes,
+        format!(
+            "本地网络可达性评估：{} 分，{}",
+            local_network_score, local_network_reason
+        ),
+    );
     push_note(&mut notes, format!("现网稳定性：{}", live_network_reason));
 
     SecurityAssessment {
@@ -2029,10 +2967,14 @@ fn assess_security(
         score,
         security_reason,
         encryption_reason,
-        gateway_level,
-        gateway_reason,
+        gfw_level,
+        gfw_score,
+        gfw_reason,
         anti_tracking_level,
         anti_tracking_reason,
+        local_network_level,
+        local_network_score,
+        local_network_reason,
         live_network_level,
         live_network_reason,
         note: notes.join("；"),
@@ -2096,11 +3038,11 @@ fn protocol_security_baseline_reason(
     format!("{protocol_name} 仍以协议层封装为主，外层伪装较弱")
 }
 
-fn assess_gateway_profile(
+fn assess_gfw_profile(
     node: &ProxyNode,
     protocol: &str,
     tls_status: &TlsProbeStatus,
-) -> (SecurityLevel, String) {
+) -> (SecurityLevel, u8, String) {
     let protocol_name = protocol_label(protocol);
     let uses_tls_like = protocol_uses_tls_like_transport(node, protocol, tls_status);
     let has_sni = has_named_value(node.server_name.as_deref());
@@ -2111,13 +3053,15 @@ fn assess_gateway_profile(
     if protocol == "http" || matches!(protocol, "socks" | "socks5") {
         return (
             SecurityLevel::Low,
-            format!("{protocol_name} 缺少 TLS/REALITY 外层伪装，过GW适配度低"),
+            28,
+            format!("{protocol_name} 缺少 TLS/REALITY 外层伪装，GFW 通过性偏低"),
         );
     }
 
     if reality_mode {
         return (
             SecurityLevel::High,
+            95,
             "使用 REALITY/XTLS Vision，链路外观更接近真实站点请求".to_owned(),
         );
     }
@@ -2125,6 +3069,7 @@ fn assess_gateway_profile(
     if matches!(protocol, "trojan" | "https") && uses_tls_like && has_sni {
         return (
             SecurityLevel::High,
+            88,
             "使用 TLS + SNI，外观接近常见 HTTPS 流量".to_owned(),
         );
     }
@@ -2132,6 +3077,7 @@ fn assess_gateway_profile(
     if uses_tls_like && has_sni && http_cover {
         return (
             SecurityLevel::High,
+            84,
             format!(
                 "使用 TLS + SNI + {} 传输伪装，更接近常见 Web 流量",
                 node.network.as_deref().unwrap_or("Web 类")
@@ -2143,25 +3089,159 @@ fn assess_gateway_profile(
         if has_alpn {
             return (
                 SecurityLevel::Medium,
+                62,
                 format!("{protocol_name} 走 QUIC/UDP，开放网络下通常较稳，但对 UDP/QUIC 策略更敏感"),
             );
         }
         return (
             SecurityLevel::Low,
-            format!("{protocol_name} 走 QUIC/UDP，但缺少 ALPN/SNI 等伪装字段，过GW风险较高"),
+            34,
+            format!("{protocol_name} 走 QUIC/UDP，但缺少 ALPN/SNI 等伪装字段，GFW 风险较高"),
         );
     }
 
     if uses_tls_like && (has_sni || http_cover) {
         return (
             SecurityLevel::Medium,
-            "具备 TLS 外层，但伪装字段不够完整，过GW能力中等".to_owned(),
+            60,
+            "具备 TLS 外层，但伪装字段不够完整，GFW 通过性中等".to_owned(),
         );
     }
 
     (
         SecurityLevel::Low,
-        format!("{protocol_name} 缺少 TLS/REALITY/SNI 等关键信号，过GW能力偏弱"),
+        30,
+        format!("{protocol_name} 缺少 TLS/REALITY/SNI 等关键信号，GFW 通过性偏弱"),
+    )
+}
+
+fn assess_local_network_profile(
+    protocol: &str,
+    udp_status: &UdpProbeStatus,
+    ttfb_status: &TtfbProbeStatus,
+    ttfb_ms: Option<u128>,
+    tcp_success_rate: f32,
+    tcp_loss_percent: f32,
+    tcp_jitter_ms: Option<u128>,
+    stability: &StabilityMetrics,
+    attempts: u8,
+) -> (SecurityLevel, u8, String) {
+    let mut score = (tcp_success_rate.clamp(0.0, 1.0) * 40.0).round() as i32;
+
+    score += if tcp_loss_percent <= 5.0 {
+        20
+    } else if tcp_loss_percent <= 15.0 {
+        12
+    } else {
+        4
+    };
+
+    score += match tcp_jitter_ms {
+        Some(jitter) if jitter <= 8 => 10,
+        Some(jitter) if jitter <= 20 => 6,
+        Some(_) => 2,
+        None if attempts > 1 => 4,
+        None => 6,
+    };
+
+    score += match ttfb_status {
+        TtfbProbeStatus::Passed(_) => match ttfb_ms {
+            Some(value) if value <= 350 => 15,
+            Some(value) if value <= 800 => 10,
+            Some(_) => 6,
+            None => 8,
+        },
+        TtfbProbeStatus::Failed(_) => 1,
+        TtfbProbeStatus::Skipped(_) => 5,
+    };
+
+    let udp_required = is_udp_required_protocol(protocol);
+    score += match udp_status {
+        UdpProbeStatus::Passed(_) => {
+            if udp_required {
+                10
+            } else {
+                6
+            }
+        }
+        UdpProbeStatus::Partial(_) => {
+            if udp_required {
+                5
+            } else {
+                4
+            }
+        }
+        UdpProbeStatus::Failed(_) => {
+            if udp_required {
+                0
+            } else {
+                2
+            }
+        }
+        UdpProbeStatus::Skipped(_) => {
+            if udp_required {
+                2
+            } else {
+                4
+            }
+        }
+    };
+
+    score += match stability.level {
+        StabilityLevel::High => 15,
+        StabilityLevel::Medium => 10,
+        StabilityLevel::Low => 4,
+        StabilityLevel::Disabled => 6,
+    };
+
+    let score = score.clamp(0, 100) as u8;
+    let level = if score >= 80 {
+        SecurityLevel::High
+    } else if score >= 55 {
+        SecurityLevel::Medium
+    } else {
+        SecurityLevel::Low
+    };
+
+    let jitter_desc = tcp_jitter_ms
+        .map(|value| format!("抖动 {value}ms"))
+        .unwrap_or_else(|| {
+            if attempts > 1 {
+                "抖动样本不足".to_owned()
+            } else {
+                "单次采样无抖动统计".to_owned()
+            }
+        });
+    let ttfb_desc = match ttfb_status {
+        TtfbProbeStatus::Passed(_) => ttfb_ms
+            .map(|value| format!("TTFB {value}ms"))
+            .unwrap_or_else(|| "TTFB 通过".to_owned()),
+        TtfbProbeStatus::Failed(reason) => format!("TTFB 失败({reason})"),
+        TtfbProbeStatus::Skipped(reason) => format!("TTFB 跳过({reason})"),
+    };
+    let stability_desc = if matches!(stability.level, StabilityLevel::Disabled) {
+        "未开启持续稳定性窗口".to_owned()
+    } else {
+        format!(
+            "稳定性 {}（窗口 {} 秒，超时率 {:.1}%）",
+            stability.level.label(),
+            stability.window_secs,
+            stability.timeout_rate_percent
+        )
+    };
+
+    (
+        level,
+        score,
+        format!(
+            "TCP 成功率 {:.0}% 、丢包 {:.1}% 、{}；{}；UDP {}；{}",
+            tcp_success_rate * 100.0,
+            tcp_loss_percent,
+            jitter_desc,
+            ttfb_desc,
+            udp_status.short_label(),
+            stability_desc
+        ),
     )
 }
 
@@ -2219,12 +3299,12 @@ fn assess_live_network_profile(
     ttfb_ms: Option<u128>,
     tcp_loss_percent: f32,
     tcp_jitter_ms: Option<u128>,
-    gateway_level: &SecurityLevel,
+    gfw_level: &SecurityLevel,
     anti_tracking_level: &SecurityLevel,
 ) -> (SecurityLevel, String) {
     let ttfb_failed = matches!(ttfb_status, TtfbProbeStatus::Failed(_));
     let jitter = tcp_jitter_ms.unwrap_or(0);
-    let gateway_low = matches!(gateway_level, SecurityLevel::Low);
+    let gfw_low = matches!(gfw_level, SecurityLevel::Low);
     let anti_low = matches!(anti_tracking_level, SecurityLevel::Low);
     let ttfb_desc = match ttfb_status {
         TtfbProbeStatus::Passed(_) => ttfb_ms
@@ -2238,7 +3318,7 @@ fn assess_live_network_profile(
         let level = if matches!(ttfb_status, TtfbProbeStatus::Passed(_))
             && tcp_loss_percent <= 5.0
             && tcp_jitter_ms.is_some_and(|value| value <= 15)
-            && !gateway_low
+            && !gfw_low
             && !anti_low
         {
             SecurityLevel::Medium
@@ -2249,11 +3329,11 @@ fn assess_live_network_profile(
         return (
             level,
             format!(
-                "未开启持续稳定性窗口，按 {}、丢包 {:.1}% 、抖动 {}ms 估计；过GW {}，防追踪 {}",
+                "未开启持续稳定性窗口，按 {}、丢包 {:.1}% 、抖动 {}ms 估计；GFW {}，防追踪 {}",
                 ttfb_desc,
                 tcp_loss_percent,
                 jitter,
-                gateway_level.label(),
+                gfw_level.label(),
                 anti_tracking_level.label()
             ),
         );
@@ -2263,7 +3343,7 @@ fn assess_live_network_profile(
         && tcp_loss_percent <= 5.0
         && jitter <= 15
         && !ttfb_failed
-        && !gateway_low
+        && !gfw_low
         && !anti_low
     {
         SecurityLevel::High
@@ -2271,7 +3351,7 @@ fn assess_live_network_profile(
         || tcp_loss_percent > 15.0
         || jitter > 30
         || ttfb_failed
-        || (gateway_low && anti_low)
+        || (gfw_low && anti_low)
     {
         SecurityLevel::Low
     } else {
@@ -2281,12 +3361,12 @@ fn assess_live_network_profile(
     (
         level,
         format!(
-            "窗口 {} 秒内超时率 {:.1}% 、最大连续失败 {}；{}；过GW {}，防追踪 {}",
+            "窗口 {} 秒内超时率 {:.1}% 、最大连续失败 {}；{}；GFW {}，防追踪 {}",
             stability.window_secs,
             stability.timeout_rate_percent,
             stability.max_consecutive_failures,
             ttfb_desc,
-            gateway_level.label(),
+            gfw_level.label(),
             anti_tracking_level.label()
         ),
     )
@@ -2630,7 +3710,9 @@ mod tests {
 
         assert!(assessment.encryption_reason.contains("Trojan"));
         assert!(assessment.encryption_reason.contains("TLS"));
-        assert_eq!(assessment.gateway_level, SecurityLevel::High);
+        assert_eq!(assessment.gfw_level, SecurityLevel::High);
+        assert!(assessment.gfw_score >= 80);
+        assert!(assessment.local_network_score >= 80);
         assert_eq!(assessment.anti_tracking_level, SecurityLevel::High);
         assert_eq!(assessment.live_network_level, SecurityLevel::High);
     }
@@ -2658,7 +3740,8 @@ mod tests {
         );
 
         assert_eq!(assessment.encryption_level, EncryptionLevel::Weak);
-        assert_eq!(assessment.gateway_level, SecurityLevel::Low);
+        assert_eq!(assessment.gfw_level, SecurityLevel::Low);
+        assert!(assessment.local_network_score >= 50);
         assert_eq!(assessment.anti_tracking_level, SecurityLevel::Low);
         assert!(assessment.live_network_reason.contains("未开启持续稳定性窗口"));
     }

@@ -2,6 +2,8 @@
 
 一个使用 Rust + egui/eframe 搭建的 Clash / 常见代理 URI 订阅检测 GUI，当前重点是“节点可用性 + 传输质量 + 安全解释 + 订阅级启发式评估”。
 
+测试结果的优劣由您的本地网络环境直接关联，本程序最初目的也是测试某一订阅在当前网络环境下的优劣，推荐您购买各家代理服务商的最基础套餐进行测试。
+
 ## 当前版本支持
 
 - 输入 Clash 订阅 URL 并下载订阅内容
@@ -21,14 +23,16 @@
   - TCP 质量指标（抖动 jitter、丢包 loss）
   - UDP 可用性探测（成功 / 部分 / 失败 + 响应耗时）
   - TLS ClientHello 预检（可选，按协议自动筛选目标）
-  - 首包时间 TTFB 基线探测（TLS / HTTP 首包）
+  - 首包时间 TTFB 探测（trojan / vless 代理链 HTTP 首包，其余协议 TLS / HTTP 基线首包）
   - 持续稳定性测试（30s / 60s 窗口，超时率 / 连续失败）
 - 协议与安全解释层
 
-  - 协议真实握手 v2：trojan / vless
+  - 协议真实握手：trojan / vless / vmess TCP AEAD / tuic / hysteria2
+  - QUIC 连接尝试：hysteria
   - 安全性评估（高 / 中 / 低，0~100 单节点评分）
   - 加密程度评估（强 / 中 / 弱 / 明文 / 未知）
-  - 过GW能力评估与原因说明
+  - GFW 通过性评估与原因说明
+  - 本地网络可达性评估与原因说明
   - 防追踪评估与原因说明
   - 现网稳定性评估与原因说明
 - 订阅级汇总与 GUI
@@ -38,7 +42,7 @@
   - 订阅质量检测（重复端点、重名节点、唯一端点统计）
   - 结果筛选与搜索（全部 / 通过 / 部分 / 失败 / 高风险）
   - 精简 / 完整两种表格模式
-  - 节点详情窗口显示安全等级、加密等级、过GW、防追踪、现网稳定性及原因
+  - 节点详情窗口显示安全等级、加密等级、GFW 通过性、本地网络可达性、防追踪、现网稳定性及原因
   - 指标说明窗口支持滚动，程序主界面为响应式布局
   - 启动后自动检查 GitHub Release 更新，并支持手动跳转下载页
 
@@ -91,15 +95,15 @@ git push origin v1.0.4
 
 ## 当前版本边界
 
-- 协议真实握手尚未补齐 vmess AEAD、tuic、hysteria / hysteria2、REALITY 细化路径。
-- TTFB 当前是 TLS / HTTP 首包基线探测，不代表“经完整代理链访问真实业务 URL”的最终业务首包。
+- 协议真实握手尚未补齐 hysteria 的应用层认证，以及 REALITY / XTLS 专用客户端路径；其中 hysteria v1 仍依赖自定义客户端协议栈，REALITY / XTLS 仍需 Xray/sing-box 级专用握手实现。
+- TTFB 当前已支持 trojan / vless 通过代理链访问测试 URL 的 HTTP 首包；其余协议仍以 TLS / HTTP 首包基线探测为主。
 - TLS 与证书安全目前以 ClientHello 预检、`skip-cert-verify` 风险和 SNI / ALPN / REALITY 配置推断为主，尚未输出证书链、到期时间、域名匹配、自签状态、TLS 版本与握手失败子类型。
 - “本机私流安全”当前是订阅配置 / 节点特征的启发式评估，不是主动 DNS 泄露测试，也没有私网流量抓包。
 - 暂未接入吞吐测试、出口 IP / ASN / 地区核验、IPv4 / IPv6 能力检测、业务场景可达性、结果导出与历史对比。
 
 ## 后续可扩展方向
 
-- 补齐 VMess AEAD 与 QUIC / REALITY 真实握手（tuic / hysteria2 / vless-reality 细化）
+- 补齐 hysteria 应用层认证与 REALITY / XTLS 专用客户端路径
 - 增加真实 DNS 泄露测试与业务场景 URL 探测
 - 支持从本地 YAML 文件导入
 - 导出检测结果 CSV / JSON

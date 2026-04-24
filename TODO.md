@@ -4,15 +4,16 @@
 
 ## 当前状态核对（2026-04）
 
-- 已完成：UDP 可用性、抖动/丢包、持续稳定性、TTFB 基线探测、标准 URI 订阅关键字段解析增强、订阅综合评分、过GW/防追踪/现网稳定性画像、本机私流安全启发式评估、GUI 解释层与详情原因展示、GitHub Release 更新检测、Windows 本地发版脚本。
-- 部分完成：协议真实握手目前覆盖 trojan / vless；证书与 TLS 细项目前仅做到策略风险提示与 ClientHello 预检；DNS 泄露目前仅做到订阅配置/节点特征的启发式评估。
-- 未完成：vmess AEAD 与 QUIC/REALITY 真实握手、吞吐测试、证书链/到期/域名匹配审计、出口信息、IPv4/IPv6、真实 DNS 泄露测试、业务场景可达性。
+- 已完成：UDP 可用性、抖动/丢包、持续稳定性、TTFB 基线探测、trojan/vless 代理链 HTTP 首包 TTFB、标准 URI 订阅关键字段解析增强、订阅综合评分、GFW 通过性/本地网络可达性/防追踪/现网稳定性画像、本机私流安全启发式评估、GUI 解释层与详情原因展示、GitHub Release 更新检测、Windows 本地发版脚本。
+- 部分完成：协议真实握手目前覆盖 trojan / vless / vmess TCP AEAD / tuic / hysteria2，hysteria 已补充 QUIC 连接尝试与失败原因分类，REALITY / XTLS 已补充参数完整度识别并避免普通 TLS 假通过；证书与 TLS 细项目前仅做到策略风险提示与 ClientHello 预检；DNS 泄露目前仅做到订阅配置/节点特征的启发式评估。
+- 未完成：hysteria 的应用层认证、REALITY / XTLS 专用客户端路径、吞吐测试、证书链/到期/域名匹配审计、出口信息、IPv4/IPv6、真实 DNS 泄露测试、业务场景可达性。
+  - 说明：hysteria v1 仍依赖自定义客户端协议栈，REALITY / XTLS 仍需 Xray/sing-box 级专用握手实现。
 
 ## Phase A - 核心可用性（优先做）
 
 - [ ] 1. 协议真实握手测试（trojan/vmess/vless/hysteria2/tuic）
   - 验收：每种协议至少 1 条真实握手路径，失败原因可分类展示。
-  - 进展：已完成 v2（trojan/vless 真实握手路径 + TLS 真实握手写入校验 + 失败原因分类）；已补齐标准 URI 订阅关键字段解析（trojan/vless/vmess/tuic/hysteria/hysteria2），为后续 vmess AEAD 与 QUIC/REALITY 实握手打通输入面；待补齐 vmess AEAD、tuic/hysteria/hysteria2 与 REALITY 细化实握手。
+  - 进展：已完成 v4（trojan/vless 真实握手路径 + vmess TCP AEAD 真实握手 + tuic/hysteria2 应用层认证 + 失败原因分类）；已补齐标准 URI 订阅关键字段解析（trojan/vless/vmess/tuic/hysteria/hysteria2），并为 hysteria 增加基于默认 ALPN 的 QUIC 连接尝试与失败原因分类，为 REALITY / XTLS 增加参数完整度识别并避免普通 TLS 假通过；待补齐 hysteria 的应用层认证与 REALITY 专用客户端路径。
 - [x] 2. UDP 可用性测试
   - 验收：输出 UDP 成功/失败与耗时，并入总体评分。
 - [x] 3. 抖动与丢包统计
@@ -26,7 +27,7 @@
 
 - [x] 6. 首包时间（TTFB）测试（基线版）
   - 验收：经节点访问测试 URL，记录连接时间与首包时间。
-  - 进展：已支持 TLS/HTTP 首包时间基线探测；后续补充“通过完整代理链访问业务 URL”的真实 TTFB。
+  - 进展：已支持 TLS/HTTP 首包时间基线探测，并为 trojan/vless 补充“通过代理链访问测试 URL”的 HTTP 首包；其余协议后续再补完整代理链真实 TTFB。
 - [ ] 7. 吞吐测试（轻量）
   - 验收：支持小流量测速（可配置），显示峰值/平均带宽。
 
@@ -41,8 +42,9 @@
 
 ## Phase D - 出口与网络能力
 
-- [x] 10. 过GW / 防追踪 / 现网稳定性画像
-  - 验收：输出过GW、防追踪、现网稳定性等级与原因，并纳入结果解释层。
+- [x] 10. GFW 通过性 / 本地网络可达性 / 防追踪 / 现网稳定性画像
+  - 验收：输出 GFW 通过性、本地网络可达性、防追踪、现网稳定性等级与原因，并纳入结果解释层。
+  - 进展：已补充 GFW 通过性 0~100 分与本地网络可达性 0~100 分，并把两者纳入节点详情解释层与总体安全评分聚合。
 - [ ] 11. 出口信息核验（IP/ASN/国家地区）
   - 验收：节点名与出口信息差异可提示风险。
 - [ ] 12. IPv4/IPv6 能力检测
@@ -85,7 +87,7 @@
 
 ## 当前建议顺序
 
-1. 协议真实握手测试（优先补 vmess AEAD / QUIC / REALITY）  
+1. 协议真实握手测试（优先补 hysteria 应用层认证与 REALITY 专用客户端）  
 2. 证书安全与 TLS 细项  
 3. 出口信息 / IPv4 / IPv6 / 真实 DNS 泄漏  
 4. 吞吐测试与业务场景可达性
