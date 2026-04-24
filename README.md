@@ -1,3 +1,25 @@
+<p align="center">
+  <a href="https://linux.do">
+    <img src="https://capsule-render.vercel.app/api?type=rect&height=210&color=0:0b0b0f,55:111827,100:c6a55a&text=linux.do&fontColor=f8fafc&fontSize=58&fontAlignY=40&desc=%E6%9E%81%E7%AE%80%E3%80%81%E6%9C%89%E6%96%99%E3%80%81%E5%80%BC%E5%BE%97%E7%82%B9%E5%BC%80&descAlignY=67" alt="linux.do 极简高端友链横幅" />
+  </a>
+</p>
+
+<p align="center">
+  CURATED FRIEND LINK
+</p>
+
+<p align="center">
+  <a href="https://linux.do">
+    <img src="https://img.shields.io/badge/Friend%20Link-linux.do-0f172a?style=for-the-badge&logo=linux&logoColor=ffffff&labelColor=c6a55a" alt="Friend Link to linux.do" />
+  </a>
+  <img src="https://img.shields.io/badge/Signal-High-0f172a?style=for-the-badge&labelColor=1f2937" alt="High Signal" />
+  <img src="https://img.shields.io/badge/Quality-First-0f172a?style=for-the-badge&labelColor=374151" alt="Quality First" />
+</p>
+
+<p align="center">
+  感谢 linux.do 社区长期输出高质量的技术讨论、实战经验与一手信息流；如果你偏爱克制但有料的内容，这个入口值得点开。
+</p>
+
 # Clash Node Checker
 
 一个使用 Rust + egui/eframe 搭建的 Clash / 常见代理 URI 订阅检测 GUI，当前重点是“节点可用性 + 传输质量 + 安全解释 + 订阅级启发式评估”。

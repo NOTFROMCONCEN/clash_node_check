@@ -736,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "clash-node-checker"
-version = "1.5.1"
+version = "1.5.9"
 dependencies = [
  "aes",
  "base64",
