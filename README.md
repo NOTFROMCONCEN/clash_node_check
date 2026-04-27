@@ -26,10 +26,15 @@
 
 测试结果的优劣由您的本地网络环境直接关联，本程序最初目的也是测试某一订阅在当前网络环境下的优劣，推荐您购买各家代理服务商的最基础套餐进行测试。
 
+## 架构快照（常驻）
+
+- [ARCHITECTURE_SNAPSHOT.md](ARCHITECTURE_SNAPSHOT.md)
+
 ## 当前版本支持
 
-- 输入 Clash 订阅 URL 并下载订阅内容
+- 输入在线订阅 URL，或本地客户端配置文件/目录路径（批量导入）
 - 解析 Clash YAML 中的 `proxies`
+- 解析 sing-box JSON 中的 `outbounds`（含启用/禁用字段）
 - 兼容常见 base64 / 标准 URI 订阅列表
 
   - 支持 trojan / vless / vmess / tuic / hysteria / hysteria2 的关键字段提取
@@ -67,6 +72,28 @@
   - 节点详情窗口显示安全等级、加密等级、GFW 通过性、本地网络可达性、防追踪、现网稳定性及原因
   - 指标说明窗口支持滚动，程序主界面为响应式布局
   - 启动后自动检查 GitHub Release 更新，并支持手动跳转下载页
+  - 支持导出可用节点配置：Clash / FlClash / Karing（自动识别预设）
+
+## 批量导入与导出说明
+
+- 输入框支持：
+  - 在线订阅 URL（`http/https`）
+  - 本地文件/目录路径（自动扫描 `yml/yaml/json/txt/conf/list`）
+- 支持自动识别主流客户端来源：`Karing / FlClash / Clash`
+- 检测后可导出可用节点（支持“包含部分通过”），导出预设：
+  - 自动识别
+  - Clash
+  - FlClash
+  - Karing
+- 导出目录：`dist/exports/export-时间戳/`
+- 当前限制：`zip` 需先手动解压后再导入目录
+
+## 顶部菜单栏
+
+- 文件：开始检测、导出可用节点、打开导出目录、清空结果、清空输入
+- 检测：启用/关闭 TLS 预检、切换稳定性窗口、重置检测参数
+- 视图：切换精简/完整表格模式、打开选中节点详情
+- 说明：指标说明、批量导入导出说明、关于
 
 ## 运行
 
@@ -84,6 +111,9 @@ cargo test
 
 - 当前程序版本来自 `Cargo.toml`，GUI 标题栏和左侧“版本与更新”卡片会显示当前版本。
 - 启动后会自动检查一次 GitHub Release 最新版本，也可以在界面中手动点击“检查更新”。
+- 更新检测默认通过 `https://github.com/<owner>/<repo>/releases/latest` 跳转地址解析版本号，不依赖 GitHub REST API 限额。
+- 更新检测内置 6 小时本地缓存（`dist/cache/release-check-cache.json`），减少重复请求。
+- 若 latest 跳转异常，会自动回退到 `releases.atom` 解析最新版本。
 - 更新检测只负责发现新版本和跳转下载，不会在本地自动覆盖可执行文件。
 - 默认 Release 源：`NOTFROMCONCEN/clash_node_check`
 
@@ -121,7 +151,7 @@ git push origin v1.0.4
 - TTFB 当前已支持 trojan / vless 通过代理链访问测试 URL 的 HTTP 首包；其余协议仍以 TLS / HTTP 首包基线探测为主。
 - TLS 与证书安全目前以 ClientHello 预检、`skip-cert-verify` 风险和 SNI / ALPN / REALITY 配置推断为主，尚未输出证书链、到期时间、域名匹配、自签状态、TLS 版本与握手失败子类型。
 - “本机私流安全”当前是订阅配置 / 节点特征的启发式评估，不是主动 DNS 泄露测试，也没有私网流量抓包。
-- 暂未接入吞吐测试、出口 IP / ASN / 地区核验、IPv4 / IPv6 能力检测、业务场景可达性、结果导出与历史对比。
+- 暂未接入吞吐测试、出口 IP / ASN / 地区核验、IPv4 / IPv6 能力检测、业务场景可达性与历史对比。
 
 ## 后续可扩展方向
 

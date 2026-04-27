@@ -1,5 +1,6 @@
 mod app;
 mod checker;
+mod client_io;
 mod subscription;
 mod update;
 

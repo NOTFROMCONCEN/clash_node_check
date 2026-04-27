@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
 use md5::{Digest, Md5};
-use ring::aead::{Aad, AES_128_GCM, LessSafeKey, Nonce, UnboundKey};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -19,10 +19,8 @@ use rustls::{
     StreamOwned,
 };
 
-use crate::subscription::{
-    inspect_subscription_config, parse_subscription, ProxyNode, SubscriptionConfigHints,
-    SubscriptionContentKind,
-};
+use crate::client_io;
+use crate::subscription::{ProxyNode, SubscriptionConfigHints, SubscriptionContentKind};
 
 #[derive(Clone, Debug)]
 pub struct CheckOptions {
@@ -76,6 +74,7 @@ pub struct StartSummary {
     pub duplicate_names: usize,
     pub tls_target_count: usize,
     pub local_privacy: SubscriptionPrivacyAssessment,
+    pub source_note: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,31 +328,18 @@ pub fn start_check(subscription_url: String, options: CheckOptions, tx: Sender<C
 }
 
 fn run_check(
-    subscription_url: &str,
+    source_input: &str,
     options: CheckOptions,
     tx: &Sender<CheckEvent>,
 ) -> Result<(), String> {
-    let content = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent("clash-node-checker/0.1")
-        .build()
-        .map_err(|error| format!("创建 HTTP 客户端失败：{error}"))?
-        .get(subscription_url)
-        .send()
-        .map_err(|error| format!("下载订阅失败：{error}"))?
-        .error_for_status()
-        .map_err(|error| format!("订阅地址返回错误：{error}"))?
-        .text()
-        .map_err(|error| format!("读取订阅内容失败：{error}"))?;
-
-    let config_hints = inspect_subscription_config(&content);
-    let nodes = parse_subscription(&content)?;
-    let summary = summarize_subscription(&nodes, &config_hints);
+    let imported = client_io::load_nodes_from_source(source_input)?;
+    let mut summary = summarize_subscription(&imported.nodes, &imported.config_hints);
+    summary.source_note = imported.source_note;
     tx.send(CheckEvent::Started(summary))
         .map_err(|error| error.to_string())?;
 
-    let node_count = nodes.len();
-    let queue = Arc::new(Mutex::new(VecDeque::from(nodes)));
+    let node_count = imported.nodes.len();
+    let queue = Arc::new(Mutex::new(VecDeque::from(imported.nodes)));
     let worker_count = options.workers.max(1).min(node_count.max(1));
     let probe_cache = Arc::new(Mutex::new(HashMap::<String, EndpointProbeResult>::new()));
     let mut handles = Vec::new();
@@ -523,6 +509,7 @@ fn summarize_subscription(
         duplicate_names,
         tls_target_count,
         local_privacy,
+        source_note: String::new(),
     }
 }
 
@@ -550,13 +537,19 @@ fn assess_subscription_local_privacy(
                     }
                     if config_hints.dns_fallback_count == 0 {
                         score -= 5;
-                        push_note(&mut notes, "DNS 未配置 fallback，上游容灾与泄露回退保护较弱");
+                        push_note(
+                            &mut notes,
+                            "DNS 未配置 fallback，上游容灾与泄露回退保护较弱",
+                        );
                     }
                     if !config_hints
                         .dns_enhanced_mode
                         .as_deref()
                         .is_some_and(|value| {
-                            matches!(value.to_ascii_lowercase().as_str(), "fake-ip" | "redir-host")
+                            matches!(
+                                value.to_ascii_lowercase().as_str(),
+                                "fake-ip" | "redir-host"
+                            )
                         })
                     {
                         score -= 10;
@@ -573,12 +566,18 @@ fn assess_subscription_local_privacy(
                             .is_some_and(|listener| !is_local_listener(listener))
                     {
                         score -= 10;
-                        push_note(&mut notes, "DNS 监听地址对局域网开放，可能扩大本地查询暴露面");
+                        push_note(
+                            &mut notes,
+                            "DNS 监听地址对局域网开放，可能扩大本地查询暴露面",
+                        );
                     }
                 }
                 Some(false) => {
                     score -= 30;
-                    push_note(&mut notes, "订阅显式关闭 DNS 模块，本机查询是否经代理无法保证");
+                    push_note(
+                        &mut notes,
+                        "订阅显式关闭 DNS 模块，本机查询是否经代理无法保证",
+                    );
                 }
                 None => {
                     score -= 25;
@@ -586,16 +585,26 @@ fn assess_subscription_local_privacy(
                 }
             }
 
-            match config_hints.mode.as_deref().map(|value| value.to_ascii_lowercase()) {
+            match config_hints
+                .mode
+                .as_deref()
+                .map(|value| value.to_ascii_lowercase())
+            {
                 Some(mode) if mode == "rule" => {
                     if config_hints.rule_count + config_hints.rule_provider_count == 0 {
                         score -= 20;
-                        push_note(&mut notes, "mode=rule 但未见 rules/rule-providers，私流分流规则不足");
+                        push_note(
+                            &mut notes,
+                            "mode=rule 但未见 rules/rule-providers，私流分流规则不足",
+                        );
                     }
                 }
                 Some(mode) if mode == "direct" => {
                     score -= 35;
-                    push_note(&mut notes, "mode=direct 会让系统流量默认直连，本机私流泄露风险高");
+                    push_note(
+                        &mut notes,
+                        "mode=direct 会让系统流量默认直连，本机私流泄露风险高",
+                    );
                 }
                 Some(mode) if mode == "global" => {
                     push_note(&mut notes, "mode=global 更依赖客户端是否正确接管系统流量");
@@ -603,7 +612,10 @@ fn assess_subscription_local_privacy(
                 _ => {
                     if config_hints.rule_count + config_hints.rule_provider_count == 0 {
                         score -= 15;
-                        push_note(&mut notes, "未见明确路由模式与规则集，难以确认私网/域名请求不会旁路");
+                        push_note(
+                            &mut notes,
+                            "未见明确路由模式与规则集，难以确认私网/域名请求不会旁路",
+                        );
                     }
                 }
             }
@@ -612,26 +624,41 @@ fn assess_subscription_local_privacy(
                 Some(true) => {
                     if config_hints.tun_auto_route != Some(true) {
                         score -= 5;
-                        push_note(&mut notes, "已启用 TUN，但未明确 auto-route，系统级接管能力存疑");
+                        push_note(
+                            &mut notes,
+                            "已启用 TUN，但未明确 auto-route，系统级接管能力存疑",
+                        );
                     }
                     if config_hints.tun_strict_route != Some(true) {
                         score -= 3;
-                        push_note(&mut notes, "已启用 TUN，但未开启 strict-route，旁路流量保护较弱");
+                        push_note(
+                            &mut notes,
+                            "已启用 TUN，但未开启 strict-route，旁路流量保护较弱",
+                        );
                     }
                     if config_hints.tun_dns_hijack_count == 0 {
                         score -= 5;
-                        push_note(&mut notes, "已启用 TUN，但未见 dns-hijack，系统 DNS 接管不完整");
+                        push_note(
+                            &mut notes,
+                            "已启用 TUN，但未见 dns-hijack，系统 DNS 接管不完整",
+                        );
                     }
                 }
                 Some(false) | None => {
                     score -= 10;
-                    push_note(&mut notes, "未启用 TUN，本机全部应用流量是否接管取决于外部客户端设置");
+                    push_note(
+                        &mut notes,
+                        "未启用 TUN，本机全部应用流量是否接管取决于外部客户端设置",
+                    );
                 }
             }
 
             if config_hints.allow_lan == Some(true) && has_local_proxy_listener(config_hints) {
                 score -= 25;
-                push_note(&mut notes, "allow-lan 已开启，本机代理端口可能暴露给局域网设备");
+                push_note(
+                    &mut notes,
+                    "allow-lan 已开启，本机代理端口可能暴露给局域网设备",
+                );
             }
             if config_hints.allow_lan == Some(true)
                 && config_hints
@@ -640,7 +667,10 @@ fn assess_subscription_local_privacy(
                     .is_some_and(|address| !is_local_listener(address))
             {
                 score -= 10;
-                push_note(&mut notes, "bind-address 并非本地回环地址，局域网访问暴露面更大");
+                push_note(
+                    &mut notes,
+                    "bind-address 并非本地回环地址，局域网访问暴露面更大",
+                );
             }
 
             if let Some(controller) = config_hints.external_controller.as_deref() {
@@ -692,7 +722,9 @@ fn assess_subscription_local_privacy(
                 score -= 20;
                 push_note(
                     &mut notes,
-                    format!("发现 {weak_transport_count} 个明文/弱隧道节点，私流经其转发时风险较高"),
+                    format!(
+                        "发现 {weak_transport_count} 个明文/弱隧道节点，私流经其转发时风险较高"
+                    ),
                 );
             }
             if insecure_cert_count > 0 {
@@ -749,9 +781,9 @@ fn node_uses_weak_private_transport(node: &ProxyNode) -> bool {
         return true;
     }
 
-    node.cipher.as_deref().is_some_and(|cipher| {
-        is_weak_cipher(&cipher.to_ascii_lowercase())
-    })
+    node.cipher
+        .as_deref()
+        .is_some_and(|cipher| is_weak_cipher(&cipher.to_ascii_lowercase()))
 }
 
 fn node_uses_tls_like_private_transport(node: &ProxyNode) -> bool {
@@ -1205,7 +1237,10 @@ fn run_trojan_proxy_ttfb(
     let mut payload = Vec::new();
     payload.extend_from_slice(hex_sha224(password).as_bytes());
     payload.extend_from_slice(b"\r\n");
-    payload.extend_from_slice(&build_trojan_connect_request(PROBE_TARGET_HOST, PROBE_TARGET_PORT));
+    payload.extend_from_slice(&build_trojan_connect_request(
+        PROBE_TARGET_HOST,
+        PROBE_TARGET_PORT,
+    ));
     payload.extend_from_slice(&build_proxy_http_request(PROBE_TARGET_HOST));
 
     let mut last_error = String::new();
@@ -1707,7 +1742,10 @@ fn run_trojan_real_probe(
     let mut payload = Vec::new();
     payload.extend_from_slice(hex_sha224(password).as_bytes());
     payload.extend_from_slice(b"\r\n");
-    payload.extend_from_slice(&build_trojan_connect_request(PROBE_TARGET_HOST, PROBE_TARGET_PORT));
+    payload.extend_from_slice(&build_trojan_connect_request(
+        PROBE_TARGET_HOST,
+        PROBE_TARGET_PORT,
+    ));
 
     let mut last_error = String::new();
     for socket_addr in socket_addrs {
@@ -1833,7 +1871,11 @@ fn run_vmess_probe(
     if !matches!(network.as_str(), "tcp" | "") {
         return ProtocolProbeStatus::Partial(format!(
             "当前仅实现 VMess TCP AEAD 真实握手，暂不支持 {} 传输",
-            if network.is_empty() { "默认" } else { network.as_str() }
+            if network.is_empty() {
+                "默认"
+            } else {
+                network.as_str()
+            }
         ));
     }
 
@@ -1842,10 +1884,11 @@ fn run_vmess_probe(
         Err(error) => return ProtocolProbeStatus::Partial(error),
     };
 
-    let request = match build_vmess_aead_request(node, PROBE_TARGET_HOST, PROBE_TARGET_PORT, cipher_method) {
-        Ok(request) => request,
-        Err(error) => return ProtocolProbeStatus::Failed(error),
-    };
+    let request =
+        match build_vmess_aead_request(node, PROBE_TARGET_HOST, PROBE_TARGET_PORT, cipher_method) {
+            Ok(request) => request,
+            Err(error) => return ProtocolProbeStatus::Failed(error),
+        };
 
     let mut last_error = String::new();
     for socket_addr in socket_addrs {
@@ -1879,7 +1922,11 @@ fn run_vmess_probe(
 }
 
 fn run_hysteria2_auth_probe(node: &ProxyNode, timeout: Duration) -> ProtocolProbeStatus {
-    let Some(auth) = node.password.as_deref().filter(|value| !value.trim().is_empty()) else {
+    let Some(auth) = node
+        .password
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
         return ProtocolProbeStatus::Failed("缺少 Hysteria2 auth/password".to_owned());
     };
 
@@ -1950,7 +1997,11 @@ fn run_tuic_auth_probe(
     let Some(uuid) = node.uuid.as_deref() else {
         return ProtocolProbeStatus::Failed("缺少 uuid/id".to_owned());
     };
-    let Some(password) = node.password.as_deref().filter(|value| !value.trim().is_empty()) else {
+    let Some(password) = node
+        .password
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
         return ProtocolProbeStatus::Failed("缺少 password".to_owned());
     };
     let uuid_bytes = match parse_uuid_bytes(uuid) {
@@ -1989,7 +2040,9 @@ fn run_tuic_auth_probe(
                 &uuid_bytes,
                 password.as_bytes(),
             )) {
-                Ok(message) => return ProtocolProbeStatus::Passed(format!("{message}(ALPN {alpn})")),
+                Ok(message) => {
+                    return ProtocolProbeStatus::Passed(format!("{message}(ALPN {alpn})"))
+                }
                 Err(error) => last_error = format!("ALPN {alpn}: {error}"),
             }
         }
@@ -2011,8 +2064,8 @@ async fn run_tuic_auth_probe_once(
     uuid: &[u8; 16],
     password: &[u8],
 ) -> Result<String, String> {
-    let (_endpoint, connection) = connect_quic_session(node, socket_addr, server_name, alpn, timeout)
-        .await?;
+    let (_endpoint, connection) =
+        connect_quic_session(node, socket_addr, server_name, alpn, timeout).await?;
 
     let mut token = [0_u8; 32];
     connection
@@ -2113,7 +2166,9 @@ fn vmess_request_cipher_method(node: &ProxyNode) -> Result<u8, String> {
         "" | "auto" | "chacha20-poly1305" | "chacha20-ietf-poly1305" => Ok(0x04),
         "aes-128-gcm" => Ok(0x03),
         "none" => Ok(0x05),
-        other => Err(format!("当前未实现 VMess 数据加密算法 {other} 的 AEAD 握手")),
+        other => Err(format!(
+            "当前未实现 VMess 数据加密算法 {other} 的 AEAD 握手"
+        )),
     }
 }
 
@@ -2123,7 +2178,10 @@ fn build_vmess_aead_request(
     target_port: u16,
     cipher_method: u8,
 ) -> Result<Vec<u8>, String> {
-    let uuid = node.uuid.as_deref().ok_or_else(|| "缺少 uuid/id".to_owned())?;
+    let uuid = node
+        .uuid
+        .as_deref()
+        .ok_or_else(|| "缺少 uuid/id".to_owned())?;
     let uuid_bytes = parse_uuid_bytes(uuid).ok_or_else(|| "uuid/id 格式无效".to_owned())?;
     let instruction_key = vmess_instruction_key(&uuid_bytes);
 
@@ -2181,10 +2239,12 @@ fn build_vmess_aead_request(
     let checksum = vmess_fnv1a(&header).to_be_bytes();
     header.extend_from_slice(&checksum);
 
-    let encrypted_length = vmess_encrypt_aead_length(&instruction_key, &auth_id, &nonce, header.len() as u16)?;
+    let encrypted_length =
+        vmess_encrypt_aead_length(&instruction_key, &auth_id, &nonce, header.len() as u16)?;
     let encrypted_header = vmess_encrypt_aead_header(&instruction_key, &auth_id, &nonce, &header)?;
 
-    let mut request = Vec::with_capacity(16 + encrypted_length.len() + nonce.len() + encrypted_header.len());
+    let mut request =
+        Vec::with_capacity(16 + encrypted_length.len() + nonce.len() + encrypted_header.len());
     request.extend_from_slice(&auth_id);
     request.extend_from_slice(&encrypted_length);
     request.extend_from_slice(&nonce);
@@ -2340,8 +2400,7 @@ fn reality_ttfb_status(node: &ProxyNode) -> TtfbProbeStatusWithLatency {
         TtfbProbeStatus::Failed(message)
     } else {
         TtfbProbeStatus::Skipped(
-            "REALITY/XTLS Vision 代理链 TTFB 需专用客户端，当前不再复用普通 TLS 基线"
-                .to_owned(),
+            "REALITY/XTLS Vision 代理链 TTFB 需专用客户端，当前不再复用普通 TLS 基线".to_owned(),
         )
     };
 
@@ -2681,8 +2740,8 @@ async fn connect_quic_transport(
     alpn: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    let (_endpoint, connection) = connect_quic_session(node, socket_addr, server_name, alpn, timeout)
-        .await?;
+    let (_endpoint, connection) =
+        connect_quic_session(node, socket_addr, server_name, alpn, timeout).await?;
     connection.close(0u32.into(), b"probe");
     Ok(())
 }
@@ -2950,7 +3009,10 @@ fn assess_security(
     let mut notes = Vec::new();
     append_notes(&mut notes, &encryption_notes);
     append_notes(&mut notes, &security_notes);
-    push_note(&mut notes, format!("GFW通过性评估：{} 分，{}", gfw_score, gfw_reason));
+    push_note(
+        &mut notes,
+        format!("GFW通过性评估：{} 分，{}", gfw_score, gfw_reason),
+    );
     push_note(&mut notes, format!("防追踪评估：{}", anti_tracking_reason));
     push_note(
         &mut notes,
@@ -3090,7 +3152,9 @@ fn assess_gfw_profile(
             return (
                 SecurityLevel::Medium,
                 62,
-                format!("{protocol_name} 走 QUIC/UDP，开放网络下通常较稳，但对 UDP/QUIC 策略更敏感"),
+                format!(
+                    "{protocol_name} 走 QUIC/UDP，开放网络下通常较稳，但对 UDP/QUIC 策略更敏感"
+                ),
             );
         }
         return (
@@ -3259,7 +3323,10 @@ fn assess_anti_tracking_profile(
     let cert_strict = node.skip_cert_verify != Some(true);
     let reality_mode = uses_reality_mode(node);
 
-    if matches!(encryption_level, EncryptionLevel::Plaintext | EncryptionLevel::Weak) {
+    if matches!(
+        encryption_level,
+        EncryptionLevel::Plaintext | EncryptionLevel::Weak
+    ) {
         return (
             SecurityLevel::Low,
             "链路加密较弱或明文，容易被侧写与关联识别".to_owned(),
@@ -3394,7 +3461,10 @@ fn protocol_uses_tls_like_transport(
 ) -> bool {
     tls_status.is_passed()
         || node.tls == Some(true)
-        || matches!(protocol, "trojan" | "https" | "tuic" | "hysteria" | "hysteria2")
+        || matches!(
+            protocol,
+            "trojan" | "https" | "tuic" | "hysteria" | "hysteria2"
+        )
         || node.security.as_deref().is_some_and(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
@@ -3404,9 +3474,13 @@ fn protocol_uses_tls_like_transport(
 }
 
 fn uses_reality_mode(node: &ProxyNode) -> bool {
-    node.security.as_deref().is_some_and(|value| {
-        matches!(value.to_ascii_lowercase().as_str(), "reality" | "xtls")
-    }) || node.flow.as_deref().is_some_and(|value| value.to_ascii_lowercase().contains("vision"))
+    node.security
+        .as_deref()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "reality" | "xtls"))
+        || node
+            .flow
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("vision"))
 }
 
 fn has_http_cover_transport(node: &ProxyNode) -> bool {
@@ -3457,9 +3531,15 @@ fn encryption_strength(
         "trojan" | "https" | "tuic" | "hysteria" | "hysteria2"
     ) {
         if matches!(protocol, "tuic" | "hysteria" | "hysteria2") {
-            push_note(notes, format!("{} 使用 QUIC/TLS 类加密", protocol_label(protocol)));
+            push_note(
+                notes,
+                format!("{} 使用 QUIC/TLS 类加密", protocol_label(protocol)),
+            );
         } else {
-            push_note(notes, format!("{} 使用 TLS 外层加密", protocol_label(protocol)));
+            push_note(
+                notes,
+                format!("{} 使用 TLS 外层加密", protocol_label(protocol)),
+            );
         }
         return (EncryptionLevel::Strong, 40);
     }
@@ -3561,17 +3641,23 @@ fn stability_security_score(stability: &StabilityMetrics, notes: &mut Vec<String
         StabilityLevel::Disabled => 6,
         StabilityLevel::High => 10,
         StabilityLevel::Medium => {
-            push_note(notes, format!(
-                "稳定性中等：超时率 {:.1}%，最大连续失败 {}",
-                stability.timeout_rate_percent, stability.max_consecutive_failures
-            ));
+            push_note(
+                notes,
+                format!(
+                    "稳定性中等：超时率 {:.1}%，最大连续失败 {}",
+                    stability.timeout_rate_percent, stability.max_consecutive_failures
+                ),
+            );
             6
         }
         StabilityLevel::Low => {
-            push_note(notes, format!(
-                "稳定性较差：超时率 {:.1}%，最大连续失败 {}",
-                stability.timeout_rate_percent, stability.max_consecutive_failures
-            ));
+            push_note(
+                notes,
+                format!(
+                    "稳定性较差：超时率 {:.1}%，最大连续失败 {}",
+                    stability.timeout_rate_percent, stability.max_consecutive_failures
+                ),
+            );
             1
         }
     }
@@ -3743,7 +3829,9 @@ mod tests {
         assert_eq!(assessment.gfw_level, SecurityLevel::Low);
         assert!(assessment.local_network_score >= 50);
         assert_eq!(assessment.anti_tracking_level, SecurityLevel::Low);
-        assert!(assessment.live_network_reason.contains("未开启持续稳定性窗口"));
+        assert!(assessment
+            .live_network_reason
+            .contains("未开启持续稳定性窗口"));
     }
 
     #[test]

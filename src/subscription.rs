@@ -174,6 +174,50 @@ struct VmessUriConfig {
     reality_short_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SingBoxConfig {
+    outbounds: Option<Vec<SingBoxOutbound>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SingBoxOutbound {
+    tag: Option<String>,
+    #[serde(rename = "type")]
+    node_type: Option<String>,
+    server: Option<String>,
+    port: Option<PortValue>,
+    #[serde(rename = "server_port")]
+    server_port: Option<PortValue>,
+    tls: Option<SingBoxTlsConfig>,
+    uuid: Option<String>,
+    password: Option<String>,
+    flow: Option<String>,
+    security: Option<String>,
+    network: Option<String>,
+    alpn: Option<StringOrList>,
+    udp: Option<BoolValue>,
+    enabled: Option<BoolValue>,
+    disabled: Option<BoolValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SingBoxTlsConfig {
+    enabled: Option<BoolValue>,
+    insecure: Option<BoolValue>,
+    #[serde(rename = "server_name")]
+    server_name: Option<String>,
+    alpn: Option<StringOrList>,
+    reality: Option<SingBoxRealityConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SingBoxRealityConfig {
+    #[serde(rename = "public_key")]
+    public_key: Option<String>,
+    #[serde(rename = "short_id")]
+    short_id: Option<String>,
+}
+
 struct ParsedUriParts {
     host_port: String,
     query_map: HashMap<String, String>,
@@ -252,6 +296,12 @@ pub fn parse_subscription(content: &str) -> Result<Vec<ProxyNode>, String> {
         }
     }
 
+    if let Ok(nodes) = parse_singbox_json(content) {
+        if !nodes.is_empty() {
+            return Ok(nodes);
+        }
+    }
+
     let decoded = decode_base64_subscription(content).unwrap_or_else(|| content.to_owned());
     let nodes = decoded
         .lines()
@@ -269,7 +319,11 @@ pub fn inspect_subscription_config(content: &str) -> SubscriptionConfigHints {
     if let Ok(config) = serde_yaml::from_str::<ClashConfig>(content) {
         return SubscriptionConfigHints {
             kind: SubscriptionContentKind::ClashYaml,
-            dns_enabled: config.dns.as_ref().and_then(|dns| dns.enable.as_ref()).and_then(BoolValue::as_bool),
+            dns_enabled: config
+                .dns
+                .as_ref()
+                .and_then(|dns| dns.enable.as_ref())
+                .and_then(BoolValue::as_bool),
             dns_listen: config
                 .dns
                 .as_ref()
@@ -340,14 +394,21 @@ pub fn inspect_subscription_config(content: &str) -> SubscriptionConfigHints {
                 .map(Vec::len)
                 .unwrap_or(0),
             rule_count: config.rules.as_ref().map(Vec::len).unwrap_or(0),
-            rule_provider_count: config.rule_providers.as_ref().map(HashMap::len).unwrap_or(0),
+            rule_provider_count: config
+                .rule_providers
+                .as_ref()
+                .map(HashMap::len)
+                .unwrap_or(0),
             external_controller: config
                 .external_controller
                 .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned),
-            secret_present: config.secret.as_deref().is_some_and(|value| !value.trim().is_empty()),
+            secret_present: config
+                .secret
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()),
         };
     }
 
@@ -406,6 +467,125 @@ fn parse_clash_yaml(content: &str) -> Result<Vec<ProxyNode>, serde_yaml::Error> 
     Ok(nodes)
 }
 
+fn parse_singbox_json(content: &str) -> Result<Vec<ProxyNode>, serde_json::Error> {
+    let config = serde_json::from_str::<SingBoxConfig>(content)?;
+    let nodes = config
+        .outbounds
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|outbound| {
+            let node_type = outbound.node_type?;
+            let lowered_type = node_type.to_ascii_lowercase();
+            if matches!(
+                lowered_type.as_str(),
+                "direct" | "block" | "dns" | "selector" | "urltest" | "fallback" | "loadbalance"
+            ) {
+                return None;
+            }
+
+            if outbound
+                .disabled
+                .as_ref()
+                .and_then(BoolValue::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if outbound
+                .enabled
+                .as_ref()
+                .and_then(BoolValue::as_bool)
+                .is_some_and(|enabled| !enabled)
+            {
+                return None;
+            }
+
+            let server = outbound.server?;
+            let port = outbound
+                .server_port
+                .as_ref()
+                .or(outbound.port.as_ref())
+                .and_then(PortValue::as_u16)?;
+
+            let tls = outbound
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.enabled.as_ref())
+                .and_then(BoolValue::as_bool)
+                .or_else(|| {
+                    if matches!(
+                        lowered_type.as_str(),
+                        "trojan" | "tuic" | "hysteria" | "hysteria2"
+                    ) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                });
+
+            let skip_cert_verify = outbound
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.insecure.as_ref())
+                .and_then(BoolValue::as_bool);
+
+            let server_name = outbound
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.server_name.clone())
+                .and_then(|value| normalize_optional_string(Some(value)));
+
+            let alpn = outbound
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.alpn.as_ref())
+                .and_then(StringOrList::as_text)
+                .or_else(|| outbound.alpn.as_ref().and_then(StringOrList::as_text));
+
+            let reality_public_key = outbound
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.reality.as_ref())
+                .and_then(|reality| normalize_optional_string(reality.public_key.clone()));
+
+            let reality_short_id = outbound
+                .tls
+                .as_ref()
+                .and_then(|tls| tls.reality.as_ref())
+                .and_then(|reality| normalize_optional_string(reality.short_id.clone()));
+
+            let name = outbound
+                .tag
+                .clone()
+                .and_then(|value| normalize_optional_string(Some(value)))
+                .unwrap_or_else(|| format!("{server}:{port}"));
+
+            Some(ProxyNode {
+                name,
+                node_type,
+                server,
+                port,
+                tls,
+                skip_cert_verify,
+                cipher: None,
+                network: normalize_optional_string(outbound.network),
+                server_name,
+                uuid: normalize_optional_string(outbound.uuid),
+                password: normalize_optional_string(outbound.password),
+                flow: normalize_optional_string(outbound.flow),
+                security: normalize_optional_string(outbound.security),
+                alpn,
+                udp: outbound.udp.and_then(|value| value.as_bool()),
+                client_fingerprint: None,
+                reality_public_key,
+                reality_short_id,
+            })
+        })
+        .collect();
+
+    Ok(nodes)
+}
+
 fn decode_base64_subscription(content: &str) -> Option<String> {
     decode_base64_text(content)
 }
@@ -433,20 +613,12 @@ fn parse_proxy_uri_line(line: &str) -> Option<ProxyNode> {
     match scheme_l.as_str() {
         "vmess" => parse_vmess_uri(trimmed, rest)
             .or_else(|| parse_standard_uri_node(trimmed, scheme, rest, None, None)),
-        "trojan" => parse_standard_uri_node(
-            trimmed,
-            scheme,
-            rest,
-            None,
-            parse_uri_parts(rest).userinfo,
-        ),
-        "vless" => parse_standard_uri_node(
-            trimmed,
-            scheme,
-            rest,
-            parse_uri_parts(rest).userinfo,
-            None,
-        ),
+        "trojan" => {
+            parse_standard_uri_node(trimmed, scheme, rest, None, parse_uri_parts(rest).userinfo)
+        }
+        "vless" => {
+            parse_standard_uri_node(trimmed, scheme, rest, parse_uri_parts(rest).userinfo, None)
+        }
         "tuic" => {
             let parts = parse_uri_parts(rest);
             let (uuid, password) = split_userinfo_pair(parts.userinfo.as_deref());
@@ -469,7 +641,13 @@ fn parse_vmess_uri(trimmed: &str, rest: &str) -> Option<ProxyNode> {
     let server = config.server.as_deref().filter(|value| !value.is_empty())?;
     let port = config.port?.as_u16()?;
     let name = extract_fragment_name(trimmed)
-        .or_else(|| config.name.as_deref().filter(|value| !value.is_empty()).map(str::to_owned))
+        .or_else(|| {
+            config
+                .name
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| format!("{server}:{port}"));
     let security = normalize_vmess_security(config.security.as_deref(), config.tls.as_deref());
     let tls = infer_vmess_tls(security.as_deref());
@@ -688,7 +866,12 @@ fn infer_tls_from_uri(scheme: &str, query_map: &HashMap<String, String>) -> Opti
 }
 
 fn infer_skip_cert_verify(query_map: &HashMap<String, String>) -> Option<bool> {
-    let candidates = ["skip-cert-verify", "allowinsecure", "allow-insecure", "insecure"];
+    let candidates = [
+        "skip-cert-verify",
+        "allowinsecure",
+        "allow-insecure",
+        "insecure",
+    ];
     for key in candidates {
         if let Some(value) = query_map.get(key).and_then(|value| parse_bool_text(value)) {
             return Some(value);
@@ -838,9 +1021,9 @@ proxies:
         assert_eq!(nodes[0].port, 443);
     }
 
-        #[test]
-        fn inspects_clash_privacy_related_config() {
-                let content = r#"
+    #[test]
+    fn inspects_clash_privacy_related_config() {
+        let content = r#"
 allow-lan: false
 bind-address: 127.0.0.1
 mixed-port: 7890
@@ -874,26 +1057,26 @@ proxies:
       port: 443
 "#;
 
-                let hints = inspect_subscription_config(content);
+        let hints = inspect_subscription_config(content);
 
-                assert_eq!(hints.kind, SubscriptionContentKind::ClashYaml);
-                assert_eq!(hints.dns_enabled, Some(true));
-                assert_eq!(hints.dns_enhanced_mode.as_deref(), Some("fake-ip"));
-                assert_eq!(hints.dns_nameserver_count, 1);
-                assert_eq!(hints.tun_enabled, Some(true));
-                assert_eq!(hints.rule_count, 1);
-                assert_eq!(hints.rule_provider_count, 1);
-                assert_eq!(hints.secret_present, true);
-        }
+        assert_eq!(hints.kind, SubscriptionContentKind::ClashYaml);
+        assert_eq!(hints.dns_enabled, Some(true));
+        assert_eq!(hints.dns_enhanced_mode.as_deref(), Some("fake-ip"));
+        assert_eq!(hints.dns_nameserver_count, 1);
+        assert_eq!(hints.tun_enabled, Some(true));
+        assert_eq!(hints.rule_count, 1);
+        assert_eq!(hints.rule_provider_count, 1);
+        assert_eq!(hints.secret_present, true);
+    }
 
-        #[test]
-        fn marks_proxy_uri_list_config_kind() {
-                let hints = inspect_subscription_config(
-                        "trojan://secret@example.com:443?sni=cdn.example.com#Trojan",
-                );
+    #[test]
+    fn marks_proxy_uri_list_config_kind() {
+        let hints = inspect_subscription_config(
+            "trojan://secret@example.com:443?sni=cdn.example.com#Trojan",
+        );
 
-                assert_eq!(hints.kind, SubscriptionContentKind::ProxyList);
-        }
+        assert_eq!(hints.kind, SubscriptionContentKind::ProxyList);
+    }
 
     #[test]
     fn parses_trojan_uri_password_from_userinfo() {
@@ -939,7 +1122,10 @@ proxies:
         assert_eq!(nodes[0].node_type, "vless");
         assert_eq!(nodes[0].security.as_deref(), Some("reality"));
         assert_eq!(nodes[0].client_fingerprint.as_deref(), Some("chrome"));
-        assert_eq!(nodes[0].reality_public_key.as_deref(), Some("demoPublicKey"));
+        assert_eq!(
+            nodes[0].reality_public_key.as_deref(),
+            Some("demoPublicKey")
+        );
         assert_eq!(nodes[0].reality_short_id.as_deref(), Some("1a2b3c4d"));
     }
 
@@ -958,14 +1144,17 @@ proxies:
             "alpn":"h2"
         }"#;
         let encoded = BASE64_STANDARD.encode(json);
-        let nodes = parse_subscription(&format!("vmess://{encoded}")) .unwrap();
+        let nodes = parse_subscription(&format!("vmess://{encoded}")).unwrap();
 
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_type, "vmess");
         assert_eq!(nodes[0].name, "VMess Demo");
         assert_eq!(nodes[0].server, "vmess.example.com");
         assert_eq!(nodes[0].port, 443);
-        assert_eq!(nodes[0].uuid.as_deref(), Some("550e8400-e29b-41d4-a716-446655440000"));
+        assert_eq!(
+            nodes[0].uuid.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
         assert_eq!(nodes[0].network.as_deref(), Some("ws"));
         assert_eq!(nodes[0].tls, Some(true));
         assert_eq!(nodes[0].security.as_deref(), Some("tls"));
@@ -989,5 +1178,41 @@ proxies:
         assert_eq!(nodes[0].password.as_deref(), Some("secret"));
         assert_eq!(nodes[0].tls, Some(true));
         assert_eq!(nodes[0].server_name.as_deref(), Some("tuic.example.com"));
+    }
+
+    #[test]
+    fn parses_singbox_outbounds_json() {
+        let content = r#"{
+          "outbounds": [
+            {
+              "type": "vless",
+              "tag": "SG-01",
+              "server": "sg.example.com",
+              "server_port": 443,
+              "uuid": "550e8400-e29b-41d4-a716-446655440000",
+              "tls": {
+                "enabled": true,
+                "insecure": false,
+                "server_name": "cdn.sg.example.com",
+                "alpn": ["h2", "http/1.1"]
+              }
+            },
+            {
+              "type": "direct",
+              "tag": "direct"
+            }
+          ]
+        }"#;
+
+        let nodes = parse_subscription(content).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_type, "vless");
+        assert_eq!(nodes[0].name, "SG-01");
+        assert_eq!(nodes[0].server, "sg.example.com");
+        assert_eq!(nodes[0].port, 443);
+        assert_eq!(nodes[0].tls, Some(true));
+        assert_eq!(nodes[0].skip_cert_verify, Some(false));
+        assert_eq!(nodes[0].server_name.as_deref(), Some("cdn.sg.example.com"));
+        assert_eq!(nodes[0].alpn.as_deref(), Some("h2,http/1.1"));
     }
 }

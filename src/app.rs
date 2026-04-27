@@ -1,4 +1,6 @@
 use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
@@ -11,6 +13,7 @@ use crate::checker::{
     ProtocolProbeStatus, SecurityLevel, StabilityLevel, StartSummary, TlsProbeStatus,
     TtfbProbeStatus, UdpProbeStatus,
 };
+use crate::client_io::{self, ExportPreset};
 use crate::update::{self, ReleaseInfo};
 
 enum UpdateCheckState {
@@ -32,9 +35,13 @@ pub struct ClashCheckerApp {
     row_filter: RowFilter,
     checking: bool,
     show_metric_guide: bool,
+    show_import_export_guide: bool,
+    show_about: bool,
     show_node_detail: bool,
     selected_result_index: Option<usize>,
     table_mode: TableMode,
+    export_preset: ExportPreset,
+    export_include_warn: bool,
     status_line: String,
     start_summary: StartSummary,
     results: Vec<NodeCheckResult>,
@@ -58,10 +65,14 @@ impl ClashCheckerApp {
             row_filter: RowFilter::All,
             checking: false,
             show_metric_guide: false,
+            show_import_export_guide: false,
+            show_about: false,
             show_node_detail: false,
             selected_result_index: None,
             table_mode: TableMode::Compact,
-            status_line: "输入 Clash 订阅地址后开始检测".to_owned(),
+            export_preset: ExportPreset::Auto,
+            export_include_warn: true,
+            status_line: "输入订阅 URL 或本地配置文件/目录后开始检测".to_owned(),
             start_summary: StartSummary::default(),
             results: Vec::new(),
             rx: None,
@@ -89,9 +100,9 @@ impl ClashCheckerApp {
     }
 
     fn start(&mut self) {
-        let url = self.subscription_url.trim().to_owned();
-        if url.is_empty() {
-            self.status_line = "请先输入订阅地址".to_owned();
+        let source = self.subscription_url.trim().to_owned();
+        if source.is_empty() {
+            self.status_line = "请先输入订阅 URL 或本地文件/目录路径".to_owned();
             return;
         }
 
@@ -110,9 +121,128 @@ impl ClashCheckerApp {
         self.show_node_detail = false;
         self.rx = Some(rx);
         self.checking = true;
-        self.status_line = "正在下载订阅并执行多项检测...".to_owned();
+        self.status_line = "正在导入配置并执行多项检测...".to_owned();
 
-        start_check(url, options, tx);
+        start_check(source, options, tx);
+    }
+
+    fn choose_import_file(&mut self) {
+        match pick_path_via_windows_dialog(DialogPickMode::File) {
+            Ok(Some(path)) => {
+                self.subscription_url = path;
+                self.status_line = "已选择导入文件路径。".to_owned();
+            }
+            Ok(None) => {
+                self.status_line = "已取消文件选择。".to_owned();
+            }
+            Err(error) => {
+                self.status_line = format!("打开文件选择器失败：{error}");
+            }
+        }
+    }
+
+    fn choose_import_directory(&mut self) {
+        match pick_path_via_windows_dialog(DialogPickMode::Directory) {
+            Ok(Some(path)) => {
+                self.subscription_url = path;
+                self.status_line = "已选择导入目录路径。".to_owned();
+            }
+            Ok(None) => {
+                self.status_line = "已取消目录选择。".to_owned();
+            }
+            Err(error) => {
+                self.status_line = format!("打开目录选择器失败：{error}");
+            }
+        }
+    }
+
+    fn export_available_nodes(&mut self) {
+        let nodes: Vec<_> = self
+            .results
+            .iter()
+            .filter(|result| {
+                result.status == NodeStatus::Pass
+                    || (self.export_include_warn && result.status == NodeStatus::Warn)
+            })
+            .map(|result| result.node.clone())
+            .collect();
+
+        if nodes.is_empty() {
+            self.status_line = "没有可导出的节点（当前筛选条件下通过数为 0）".to_owned();
+            return;
+        }
+
+        match client_io::export_nodes_for_clients(&nodes, self.export_preset) {
+            Ok(outcome) => {
+                let file_names = outcome
+                    .files
+                    .iter()
+                    .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status_line = format!(
+                    "导出完成：{} 节点 -> {}（{}）",
+                    outcome.node_count,
+                    outcome.output_dir.display(),
+                    file_names
+                );
+            }
+            Err(error) => {
+                self.status_line = format!("导出失败：{error}");
+            }
+        }
+    }
+
+    fn clear_results(&mut self) {
+        self.results.clear();
+        self.start_summary = StartSummary::default();
+        self.selected_result_index = None;
+        self.show_node_detail = false;
+        self.status_line = "结果已清空。".to_owned();
+    }
+
+    fn reset_detection_options(&mut self) {
+        self.timeout_secs = 5.0;
+        self.attempts = 3;
+        self.workers = 24;
+        self.enable_tls_probe = true;
+        self.stability_window_secs = 0;
+        self.status_line = "检测参数已重置为默认值。".to_owned();
+    }
+
+    fn exports_root_dir() -> Option<PathBuf> {
+        std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.join("dist").join("exports"))
+    }
+
+    fn open_exports_folder(&mut self) {
+        let Some(path) = Self::exports_root_dir() else {
+            self.status_line = "无法定位导出目录。".to_owned();
+            return;
+        };
+
+        if !path.exists() {
+            self.status_line = format!("导出目录尚未生成：{}", path.display());
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            match std::process::Command::new("explorer").arg(&path).spawn() {
+                Ok(_) => {
+                    self.status_line = format!("已打开导出目录：{}", path.display());
+                }
+                Err(error) => {
+                    self.status_line = format!("打开导出目录失败：{error}");
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.status_line = format!("导出目录：{}", path.display());
+        }
     }
 
     fn drain_events(&mut self) {
@@ -125,13 +255,17 @@ impl ClashCheckerApp {
                     CheckEvent::Started(summary) => {
                         self.start_summary = summary.clone();
                         self.results.reserve(summary.total);
-                        self.status_line = format!(
+                        let mut message = format!(
                             "解析到 {} 个节点（唯一端点 {}，重复端点 {}，重名 {}），开始检测...",
                             summary.total,
                             summary.unique_endpoints,
                             summary.duplicate_endpoints,
                             summary.duplicate_names
                         );
+                        if !summary.source_note.trim().is_empty() {
+                            message = format!("{} | {}", summary.source_note.trim(), message);
+                        }
+                        self.status_line = message;
                     }
                     CheckEvent::NodeFinished(result) => {
                         self.results.push(result);
@@ -231,7 +365,9 @@ impl ClashCheckerApp {
                             format!("当前已是最新版本 v{}", release.latest_version),
                         );
                         if let Some(published_at) = release.published_at.as_deref() {
-                            response.on_hover_text(format!("最近一次 Release 发布时间: {published_at}"));
+                            response.on_hover_text(format!(
+                                "最近一次 Release 发布时间: {published_at}"
+                            ));
                         }
                         if let Some(notes) = release.notes.as_deref() {
                             ui.add_space(4.0);
@@ -282,12 +418,9 @@ impl ClashCheckerApp {
 
                 ui.add_space(6.0);
                 ui.label(
-                    RichText::new(format!(
-                        "Release 源：{}",
-                        update::release_repository_slug()
-                    ))
-                    .small()
-                    .weak(),
+                    RichText::new(format!("Release 源：{}", update::release_repository_slug()))
+                        .small()
+                        .weak(),
                 );
             },
         );
@@ -458,11 +591,17 @@ impl ClashCheckerApp {
             vec![
                 (
                     "订阅综合",
-                    format!("{} / 100 ({})", subscription_score.score, subscription_score.grade),
+                    format!(
+                        "{} / 100 ({})",
+                        subscription_score.score, subscription_score.grade
+                    ),
                 ),
                 (
                     "本机私流",
-                    format!("{}（启发式）", self.start_summary.local_privacy.level.label()),
+                    format!(
+                        "{}（启发式）",
+                        self.start_summary.local_privacy.level.label()
+                    ),
                 ),
                 ("总节点", self.results.len().to_string()),
                 (
@@ -501,7 +640,10 @@ impl ClashCheckerApp {
                         self.percent(self.tls_passed_count())
                     ),
                 ),
-                ("重复端点", self.start_summary.duplicate_endpoints.to_string()),
+                (
+                    "重复端点",
+                    self.start_summary.duplicate_endpoints.to_string(),
+                ),
                 ("重名节点", self.start_summary.duplicate_names.to_string()),
                 ("TLS目标", self.start_summary.tls_target_count.to_string()),
                 (
@@ -1165,14 +1307,25 @@ impl ClashCheckerApp {
                 panel_card(
                     ui,
                     "检测控制",
-                    Some("输入订阅地址并配置本次探测参数"),
+                    Some("输入订阅 URL 或本地客户端配置文件/目录，并配置本次探测参数"),
                     |ui| {
-                        ui.label("订阅 URL");
+                        ui.label("订阅 URL / 本地路径");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.subscription_url)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("https://example.com/clash.yaml"),
+                                .hint_text(
+                                    "https://example.com/sub.yaml 或 C:\\Users\\...\\karing",
+                                ),
                         );
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("选择文件").clicked() {
+                                self.choose_import_file();
+                            }
+                            if ui.button("选择目录").clicked() {
+                                self.choose_import_directory();
+                            }
+                        });
                         ui.add_space(10.0);
 
                         ui.label(RichText::new("检测参数").strong());
@@ -1190,15 +1343,12 @@ impl ClashCheckerApp {
                                 ui.end_row();
 
                                 ui.label("采样次数");
-                                ui.add(
-                                    egui::Slider::new(&mut self.attempts, 1..=10).suffix(" 次"),
-                                );
+                                ui.add(egui::Slider::new(&mut self.attempts, 1..=10).suffix(" 次"));
                                 ui.end_row();
 
                                 ui.label("并发");
                                 ui.add(
-                                    egui::Slider::new(&mut self.workers, 1..=128)
-                                        .suffix(" 线程"),
+                                    egui::Slider::new(&mut self.workers, 1..=128).suffix(" 线程"),
                                 );
                                 ui.end_row();
                             });
@@ -1227,11 +1377,48 @@ impl ClashCheckerApp {
                         }
 
                         ui.add_space(8.0);
+                        ui.label(RichText::new("导出配置").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            egui::ComboBox::from_id_source("export_preset")
+                                .selected_text(self.export_preset.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_preset,
+                                        ExportPreset::Auto,
+                                        ExportPreset::Auto.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_preset,
+                                        ExportPreset::Clash,
+                                        ExportPreset::Clash.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_preset,
+                                        ExportPreset::FlClash,
+                                        ExportPreset::FlClash.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_preset,
+                                        ExportPreset::Karing,
+                                        ExportPreset::Karing.label(),
+                                    );
+                                });
+                            ui.checkbox(&mut self.export_include_warn, "包含部分通过");
+                            if ui
+                                .add_enabled(
+                                    !self.checking && !self.results.is_empty(),
+                                    egui::Button::new("导出可用节点"),
+                                )
+                                .clicked()
+                            {
+                                self.export_available_nodes();
+                            }
+                        });
+
+                        ui.add_space(8.0);
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&self.status_line)
-                                    .small()
-                                    .color(status_color),
+                                RichText::new(&self.status_line).small().color(status_color),
                             )
                             .wrap(),
                         );
@@ -1290,7 +1477,10 @@ impl ClashCheckerApp {
                                     self.start_summary.local_privacy.level.label()
                                 ),
                             ),
-                            ("当前显示", format!("{} / {}", filtered_count, self.results.len())),
+                            (
+                                "当前显示",
+                                format!("{} / {}", filtered_count, self.results.len()),
+                            ),
                         ];
                         summary_tile_grid(ui, &overview_items);
                         ui.add_space(8.0);
@@ -1316,8 +1506,7 @@ impl ClashCheckerApp {
                             );
                             response.on_hover_text(format!(
                                 "订阅评级: {}\n{}",
-                                subscription_score.grade,
-                                subscription_score.note
+                                subscription_score.grade, subscription_score.note
                             ));
                         });
 
@@ -1416,7 +1605,7 @@ impl ClashCheckerApp {
                             result_empty_state(
                                 ui,
                                 "还没有检测结果",
-                                "在左侧输入订阅地址并点击“开始检测”，完成后这里会显示节点列表、状态和详细指标。",
+                                "在左侧输入订阅 URL 或本地客户端配置路径并点击“开始检测”，完成后这里会显示节点列表、状态和详细指标。",
                             );
                         } else if filtered_indices.is_empty() {
                             result_empty_state(
@@ -1452,13 +1641,99 @@ impl eframe::App for ClashCheckerApp {
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
+                ui.menu_button("文件", |ui| {
+                    if ui.button("选择导入文件").clicked() {
+                        self.choose_import_file();
+                        ui.close_menu();
+                    }
+                    if ui.button("选择导入目录").clicked() {
+                        self.choose_import_directory();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.checking, egui::Button::new("开始检测"))
+                        .clicked()
+                    {
+                        self.start();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.checking && !self.results.is_empty(),
+                            egui::Button::new("导出可用节点"),
+                        )
+                        .clicked()
+                    {
+                        self.export_available_nodes();
+                        ui.close_menu();
+                    }
+                    if ui.button("打开导出目录").clicked() {
+                        self.open_exports_folder();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("清空结果").clicked() {
+                        self.clear_results();
+                        ui.close_menu();
+                    }
+                    if ui.button("清空输入").clicked() {
+                        self.subscription_url.clear();
+                        self.status_line = "已清空输入。".to_owned();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("检测", |ui| {
+                    ui.checkbox(&mut self.enable_tls_probe, "启用 TLS 握手检测");
+                    ui.separator();
+                    ui.label("稳定性窗口");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(&mut self.stability_window_secs, 0, "关闭");
+                        ui.selectable_value(&mut self.stability_window_secs, 30, "30秒");
+                        ui.selectable_value(&mut self.stability_window_secs, 60, "60秒");
+                    });
+                    ui.separator();
+                    if ui.button("重置检测参数").clicked() {
+                        self.reset_detection_options();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("视图", |ui| {
+                    ui.label("表格模式");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(&mut self.table_mode, TableMode::Compact, "精简");
+                        ui.selectable_value(&mut self.table_mode, TableMode::Full, "完整");
+                    });
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.selected_result_index.is_some(),
+                            egui::Button::new("打开选中节点详情"),
+                        )
+                        .clicked()
+                    {
+                        self.show_node_detail = true;
+                        ui.close_menu();
+                    }
+                });
+
                 ui.menu_button("说明", |ui| {
                     if ui.button("指标说明").clicked() {
                         self.show_metric_guide = true;
                         ui.close_menu();
                     }
+                    if ui.button("批量导入导出说明").clicked() {
+                        self.show_import_export_guide = true;
+                        ui.close_menu();
+                    }
                     if ui.button("状态颜色说明").clicked() {
                         self.show_metric_guide = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("关于").clicked() {
+                        self.show_about = true;
                         ui.close_menu();
                     }
                 });
@@ -1578,6 +1853,19 @@ impl eframe::App for ClashCheckerApp {
                             ui.label("节点结果卡片默认显示约 20 行，可在卡片内部上下滚动查看更多节点。");
                             ui.add_space(8.0);
 
+                            ui.heading("顶部菜单栏");
+                            ui.label("文件：开始检测、导出可用节点、打开导出目录、清空结果、清空输入。");
+                            ui.label("检测：快速切换 TLS 预检与稳定性窗口，支持一键重置参数。");
+                            ui.label("视图：切换精简/完整表格模式，并打开选中节点详情。");
+                            ui.label("说明：指标说明、批量导入导出说明、关于。");
+                            ui.add_space(8.0);
+
+                            ui.heading("批量导入与导出");
+                            ui.label("输入框支持在线订阅 URL，也支持本地文件/目录路径（自动扫描 yml/yaml/json/txt/conf/list；zip 请先解压）。");
+                            ui.label("可直接点击“选择文件/选择目录”按钮，通过系统对话框填入导入路径。");
+                            ui.label("导出配置支持 Clash / FlClash / Karing，导出目录默认在 dist/exports 下。");
+                            ui.add_space(8.0);
+
                             ui.heading("详情查看");
                             ui.label("双击列表任意节点，可打开“节点详细信息”窗口。");
                             ui.label("详细信息里会显示协议参数、TLS状态、安全等级、评分与评估说明。");
@@ -1604,6 +1892,69 @@ impl eframe::App for ClashCheckerApp {
                             ui.label("橙色：部分通过（有风险项，建议复测）。");
                             ui.label("红色：失败（当前检测项不通过）。");
                         });
+                });
+        }
+
+        if self.show_import_export_guide {
+            egui::Window::new("批量导入导出说明")
+                .open(&mut self.show_import_export_guide)
+                .resizable(true)
+                .default_size([760.0, 560.0])
+                .min_size([520.0, 360.0])
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.heading("导入（自动识别）");
+                            ui.label("输入框支持两类来源：");
+                            ui.label("1. 在线订阅 URL（http/https）");
+                            ui.label(
+                                "2. 本地配置文件或目录（自动扫描 yml/yaml/json/txt/conf/list）",
+                            );
+                            ui.label("支持识别主流客户端来源：Karing / FlClash / Clash。");
+                            ui.label("说明：ZIP 当前需先解压，再导入解压后的目录。");
+                            ui.add_space(8.0);
+
+                            ui.heading("导出（可用节点）");
+                            ui.label("检测完成后可导出“通过”节点，或勾选“包含部分通过”一起导出。");
+                            ui.label("导出预设：自动识别 / Clash / FlClash / Karing。");
+                            ui.label("导出目录：dist/exports/export-时间戳/");
+                            ui.add_space(8.0);
+
+                            ui.heading("推荐流程");
+                            ui.label("1. 导入本地客户端配置目录或订阅 URL");
+                            ui.label("2. 设置超时/采样/并发，执行检测");
+                            ui.label("3. 过滤结果并确认可用节点");
+                            ui.label("4. 导出目标客户端配置并回到客户端导入");
+                            ui.add_space(8.0);
+
+                            ui.heading("常见问题");
+                            ui.label(
+                                "TLS 失败不一定等于订阅失效，常见是预检兼容性或网络环境导致。",
+                            );
+                            ui.label("若 TCP 连续成功，节点在真实客户端中仍可能可用。");
+                        });
+                });
+        }
+
+        if self.show_about {
+            egui::Window::new("关于 Clash Node Checker")
+                .open(&mut self.show_about)
+                .resizable(true)
+                .default_size([560.0, 360.0])
+                .min_size([420.0, 260.0])
+                .show(ctx, |ui| {
+                    ui.heading("Clash Node Checker");
+                    ui.label(format!("当前版本：v{}", update::current_version()));
+                    ui.add_space(8.0);
+                    ui.label("定位：节点可用性 + 传输质量 + 安全解释 + 订阅级评估。");
+                    ui.label("已支持：主流客户端批量导入与导出（Karing / FlClash / Clash）。");
+                    ui.add_space(8.0);
+                    ui.hyperlink_to("GitHub Releases", update::release_repository_url());
+                    ui.label(
+                        RichText::new(format!("Release 源：{}", update::release_repository_slug()))
+                            .weak(),
+                    );
                 });
         }
 
@@ -1858,6 +2209,74 @@ impl eframe::App for ClashCheckerApp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DialogPickMode {
+    File,
+    Directory,
+}
+
+fn pick_path_via_windows_dialog(mode: DialogPickMode) -> Result<Option<String>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let script = match mode {
+            DialogPickMode::File => {
+                r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Filter = "配置文件|*.yml;*.yaml;*.json;*.txt;*.conf;*.list|所有文件|*.*"
+$dialog.Multiselect = $false
+$dialog.CheckFileExists = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  Write-Output $dialog.FileName
+}
+"#
+            }
+            DialogPickMode::Directory => {
+                r#"
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.ShowNewFolderButton = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  Write-Output $dialog.SelectedPath
+}
+"#
+            }
+        };
+
+        let output = Command::new("powershell")
+            .arg("-NoProfile")
+            .arg("-STA")
+            .arg("-Command")
+            .arg(script)
+            .output()
+            .map_err(|error| error.to_string())?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            if stderr.is_empty() {
+                return Err(format!(
+                    "对话框命令执行失败，退出码 {:?}",
+                    output.status.code()
+                ));
+            }
+            return Err(stderr);
+        }
+
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if path.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(path))
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = mode;
+        Err("当前平台暂不支持系统文件选择器".to_owned())
+    }
+}
+
 struct SubscriptionAggregateScore {
     score: u8,
     grade: &'static str,
@@ -1928,10 +2347,8 @@ fn compute_subscription_score(
         .filter(|result| result.status == NodeStatus::Pass)
         .count() as f32
         / total;
-    let availability_points = score_points(
-        dns_rate * 0.25 + tcp_rate * 0.35 + strict_rate * 0.40,
-        35,
-    );
+    let availability_points =
+        score_points(dns_rate * 0.25 + tcp_rate * 0.35 + strict_rate * 0.40, 35);
 
     let avg_security_score = results
         .iter()
@@ -1984,13 +2401,12 @@ fn compute_subscription_score(
     let unique_name_ratio = if start_summary.total == 0 {
         1.0
     } else {
-        (start_summary.total.saturating_sub(start_summary.duplicate_names)) as f32
+        (start_summary
+            .total
+            .saturating_sub(start_summary.duplicate_names)) as f32
             / start_summary.total as f32
     };
-    let hygiene_points = score_points(
-        unique_endpoint_ratio * 0.60 + unique_name_ratio * 0.40,
-        5,
-    );
+    let hygiene_points = score_points(unique_endpoint_ratio * 0.60 + unique_name_ratio * 0.40, 5);
 
     let score = availability_points
         .saturating_add(security_points)
@@ -2288,6 +2704,7 @@ mod tests {
             duplicate_names: 0,
             tls_target_count: 2,
             local_privacy: Default::default(),
+            source_note: String::new(),
         };
 
         let aggregate = compute_subscription_score(&results, &summary);
@@ -2324,6 +2741,7 @@ mod tests {
             duplicate_names: 1,
             tls_target_count: 2,
             local_privacy: Default::default(),
+            source_note: String::new(),
         };
         let aggregate = compute_subscription_score(&[weak_result.clone(), weak_result], &summary);
 
