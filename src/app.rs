@@ -10,10 +10,11 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::checker::{
     start_check, CheckEvent, CheckOptions, EncryptionLevel, NodeCheckResult, NodeStatus,
-    ProtocolProbeStatus, SecurityLevel, StabilityLevel, StartSummary, TlsProbeStatus,
+    ProtocolProbeStatus, SecurityLevel, StabilityLevel, StartSummary, TlsProbeMode, TlsProbeStatus,
     TtfbProbeStatus, UdpProbeStatus,
 };
 use crate::client_io::{self, ExportPreset};
+use crate::history::{self, HistorySnapshot};
 use crate::update::{self, ReleaseInfo};
 
 enum UpdateCheckState {
@@ -30,6 +31,7 @@ pub struct ClashCheckerApp {
     attempts: u32,
     workers: u32,
     enable_tls_probe: bool,
+    tls_probe_mode: TlsProbeMode,
     stability_window_secs: u32,
     search_text: String,
     row_filter: RowFilter,
@@ -42,12 +44,17 @@ pub struct ClashCheckerApp {
     table_mode: TableMode,
     export_preset: ExportPreset,
     export_include_warn: bool,
+    export_protocol_filter: ExportProtocolFilter,
+    export_min_score: u8,
+    export_max_latency_ms: u16,
     status_line: String,
     start_summary: StartSummary,
     results: Vec<NodeCheckResult>,
     rx: Option<Receiver<CheckEvent>>,
     update_state: UpdateCheckState,
     update_rx: Option<Receiver<Result<ReleaseInfo, String>>>,
+    history_snapshots: Vec<HistorySnapshot>,
+    show_history_window: bool,
 }
 
 impl ClashCheckerApp {
@@ -60,6 +67,7 @@ impl ClashCheckerApp {
             attempts: 3,
             workers: 24,
             enable_tls_probe: true,
+            tls_probe_mode: TlsProbeMode::FastClientHello,
             stability_window_secs: 0,
             search_text: String::new(),
             row_filter: RowFilter::All,
@@ -72,12 +80,17 @@ impl ClashCheckerApp {
             table_mode: TableMode::Compact,
             export_preset: ExportPreset::Auto,
             export_include_warn: true,
+            export_protocol_filter: ExportProtocolFilter::All,
+            export_min_score: 0,
+            export_max_latency_ms: 0,
             status_line: "输入订阅 URL 或本地配置文件/目录后开始检测".to_owned(),
             start_summary: StartSummary::default(),
             results: Vec::new(),
             rx: None,
             update_state: UpdateCheckState::Idle,
             update_rx: None,
+            history_snapshots: history::load_snapshots(),
+            show_history_window: false,
         };
 
         app.trigger_update_check();
@@ -112,6 +125,7 @@ impl ClashCheckerApp {
             attempts: self.attempts.clamp(1, 10) as u8,
             workers: self.workers.clamp(1, 128) as usize,
             enable_tls_probe: self.enable_tls_probe,
+            tls_probe_mode: self.tls_probe_mode,
             stability_window_secs: self.stability_window_secs.clamp(0, 60) as u16,
         };
 
@@ -157,18 +171,31 @@ impl ClashCheckerApp {
     }
 
     fn export_available_nodes(&mut self) {
-        let nodes: Vec<_> = self
+        let selected_results: Vec<_> = self
             .results
             .iter()
             .filter(|result| {
                 result.status == NodeStatus::Pass
                     || (self.export_include_warn && result.status == NodeStatus::Warn)
             })
+            .filter(|result| self.export_protocol_filter.matches(result))
+            .filter(|result| result.security.score >= self.export_min_score)
+            .filter(|result| {
+                self.export_max_latency_ms == 0
+                    || result
+                        .tcp_avg_latency_ms
+                        .is_some_and(|value| value <= self.export_max_latency_ms as u128)
+            })
+            .collect();
+
+        let nodes: Vec<_> = selected_results
+            .iter()
             .map(|result| result.node.clone())
             .collect();
 
         if nodes.is_empty() {
-            self.status_line = "没有可导出的节点（当前筛选条件下通过数为 0）".to_owned();
+            self.status_line =
+                "没有可导出的节点（导出筛选条件下通过数为 0，请放宽筛选）".to_owned();
             return;
         }
 
@@ -181,8 +208,9 @@ impl ClashCheckerApp {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.status_line = format!(
-                    "导出完成：{} 节点 -> {}（{}）",
+                    "导出完成：{} 节点（筛选命中 {}）-> {}（{}）",
                     outcome.node_count,
+                    selected_results.len(),
                     outcome.output_dir.display(),
                     file_names
                 );
@@ -206,8 +234,49 @@ impl ClashCheckerApp {
         self.attempts = 3;
         self.workers = 24;
         self.enable_tls_probe = true;
+        self.tls_probe_mode = TlsProbeMode::FastClientHello;
         self.stability_window_secs = 0;
         self.status_line = "检测参数已重置为默认值。".to_owned();
+    }
+
+    fn average_security_score(&self) -> u8 {
+        if self.results.is_empty() {
+            return 0;
+        }
+        let sum: u32 = self
+            .results
+            .iter()
+            .map(|item| item.security.score as u32)
+            .sum();
+        ((sum as f32 / self.results.len() as f32).round() as u32).min(100) as u8
+    }
+
+    fn append_history_snapshot(&mut self) {
+        if self.results.is_empty() {
+            return;
+        }
+
+        let snapshot = HistorySnapshot {
+            unix_ts: history::build_unix_ts(),
+            total: self.results.len(),
+            tcp_alive: self.tcp_alive_count(),
+            strict_pass: self.pass_count(),
+            warn: self.warn_count(),
+            fail: self.fail_count(),
+            tls_pass: self.tls_passed_count(),
+            udp_pass: self.udp_pass_count(),
+            ttfb_pass: self.ttfb_pass_count(),
+            avg_security_score: self.average_security_score(),
+        };
+
+        match history::append_snapshot(snapshot, 40) {
+            Ok(_) => {
+                self.history_snapshots = history::load_snapshots();
+            }
+            Err(error) => {
+                self.status_line = format!("历史快照写入失败：{error}");
+            }
+        }
     }
 
     fn exports_root_dir() -> Option<PathBuf> {
@@ -248,6 +317,7 @@ impl ClashCheckerApp {
     fn drain_events(&mut self) {
         let mut should_clear_rx = false;
         let mut should_clear_update_rx = false;
+        let mut should_append_history_snapshot = false;
 
         if let Some(rx) = &self.rx {
             while let Ok(event) = rx.try_recv() {
@@ -282,6 +352,7 @@ impl ClashCheckerApp {
                     }
                     CheckEvent::Finished => {
                         self.checking = false;
+                        should_append_history_snapshot = true;
                         self.status_line = format!(
                             "检测完成：共 {} 个，TCP可连 {} 个，UDP通过 {} 个，TTFB通过 {} 个，严格通过 {} 个，失败 {} 个",
                             self.results.len(),
@@ -319,6 +390,10 @@ impl ClashCheckerApp {
 
         if should_clear_update_rx {
             self.update_rx = None;
+        }
+
+        if should_append_history_snapshot {
+            self.append_history_snapshot();
         }
     }
 
@@ -422,6 +497,39 @@ impl ClashCheckerApp {
                         .small()
                         .weak(),
                 );
+            },
+        );
+    }
+
+    fn history_card_ui(&mut self, ui: &mut egui::Ui) {
+        panel_card(
+            ui,
+            "检测历史快照",
+            Some("每次检测完成会自动保存一条摘要（最多保留 40 条）"),
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    metric_chip(ui, "已保存", &self.history_snapshots.len().to_string());
+                    if ui.button("打开历史窗口").clicked() {
+                        self.show_history_window = true;
+                    }
+                    if ui.button("刷新").clicked() {
+                        self.history_snapshots = history::load_snapshots();
+                    }
+                });
+
+                ui.add_space(6.0);
+                if let Some(last) = self.history_snapshots.last() {
+                    ui.label(format!(
+                        "最近一次：{} | 总节点 {} | 严格通过 {} | 失败 {} | 平均安全分 {}",
+                        last.timestamp_label(),
+                        last.total,
+                        last.strict_pass,
+                        last.fail,
+                        last.avg_security_score
+                    ));
+                } else {
+                    ui.label("暂无历史记录。完成一次检测后会自动生成快照。");
+                }
             },
         );
     }
@@ -1356,6 +1464,17 @@ impl ClashCheckerApp {
                         ui.add_space(6.0);
                         ui.horizontal_wrapped(|ui| {
                             ui.checkbox(&mut self.enable_tls_probe, "TLS 握手检测");
+                            ui.label("模式");
+                            ui.selectable_value(
+                                &mut self.tls_probe_mode,
+                                TlsProbeMode::FastClientHello,
+                                TlsProbeMode::FastClientHello.label(),
+                            );
+                            ui.selectable_value(
+                                &mut self.tls_probe_mode,
+                                TlsProbeMode::StandardHandshake,
+                                TlsProbeMode::StandardHandshake.label(),
+                            );
                             ui.label("稳定性窗口");
                             ui.selectable_value(&mut self.stability_window_secs, 0, "关闭");
                             ui.selectable_value(&mut self.stability_window_secs, 30, "30秒");
@@ -1404,6 +1523,65 @@ impl ClashCheckerApp {
                                     );
                                 });
                             ui.checkbox(&mut self.export_include_warn, "包含部分通过");
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("协议");
+                            egui::ComboBox::from_id_source("export_protocol_filter")
+                                .selected_text(self.export_protocol_filter.label())
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::All,
+                                        ExportProtocolFilter::All.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::Trojan,
+                                        ExportProtocolFilter::Trojan.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::Vless,
+                                        ExportProtocolFilter::Vless.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::Vmess,
+                                        ExportProtocolFilter::Vmess.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::Hysteria2,
+                                        ExportProtocolFilter::Hysteria2.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::Tuic,
+                                        ExportProtocolFilter::Tuic.label(),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_protocol_filter,
+                                        ExportProtocolFilter::TlsLike,
+                                        ExportProtocolFilter::TlsLike.label(),
+                                    );
+                                });
+                            ui.label("最小评分");
+                            ui.add(egui::Slider::new(&mut self.export_min_score, 0..=100));
+                            ui.label("最大延迟");
+                            ui.add(
+                                egui::DragValue::new(&mut self.export_max_latency_ms)
+                                    .suffix(" ms")
+                                    .speed(1),
+                            );
+                            if ui.button("重置筛选").clicked() {
+                                self.export_protocol_filter = ExportProtocolFilter::All;
+                                self.export_min_score = 0;
+                                self.export_max_latency_ms = 0;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add_enabled(
                                     !self.checking && !self.results.is_empty(),
@@ -1413,6 +1591,7 @@ impl ClashCheckerApp {
                             {
                                 self.export_available_nodes();
                             }
+                            ui.small("最大延迟设为 0 表示不限制");
                         });
 
                         ui.add_space(8.0);
@@ -1537,6 +1716,9 @@ impl ClashCheckerApp {
 
                 ui.add_space(10.0);
                 self.version_update_card_ui(ui);
+
+                ui.add_space(10.0);
+                self.history_card_ui(ui);
 
                 if let Some(result) = self
                     .selected_result_index
@@ -1686,6 +1868,19 @@ impl eframe::App for ClashCheckerApp {
 
                 ui.menu_button("检测", |ui| {
                     ui.checkbox(&mut self.enable_tls_probe, "启用 TLS 握手检测");
+                    ui.label("TLS 模式");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.selectable_value(
+                            &mut self.tls_probe_mode,
+                            TlsProbeMode::FastClientHello,
+                            TlsProbeMode::FastClientHello.label(),
+                        );
+                        ui.selectable_value(
+                            &mut self.tls_probe_mode,
+                            TlsProbeMode::StandardHandshake,
+                            TlsProbeMode::StandardHandshake.label(),
+                        );
+                    });
                     ui.separator();
                     ui.label("稳定性窗口");
                     ui.horizontal_wrapped(|ui| {
@@ -1715,6 +1910,10 @@ impl eframe::App for ClashCheckerApp {
                         .clicked()
                     {
                         self.show_node_detail = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("打开检测历史窗口").clicked() {
+                        self.show_history_window = true;
                         ui.close_menu();
                     }
                 });
@@ -1835,7 +2034,7 @@ impl eframe::App for ClashCheckerApp {
                             ui.label("TTFB：首包时间探测。trojan/vless 已支持通过代理链访问测试 URL 的 HTTP 首包；其中 VLESS REALITY/XTLS 当前会跳过，避免复用普通 TLS 基线误判；其余协议仍以 TLS/HTTP 首包基线实现。");
                             ui.label("稳定性：在 30/60 秒窗口内统计超时率与连续失败次数。");
                             ui.label("协议探测：trojan/vless、vmess TCP AEAD、hysteria2 已接入真实路径；tuic/hysteria 当前为 QUIC 连接尝试；REALITY/XTLS 当前会识别参数完整度并避免误判为普通 TLS 成功。");
-                            ui.label("TLS：对 TLS 类协议执行 ClientHello 预检的结果；当前不等同于证书链、到期时间、域名匹配的完整审计。");
+                            ui.label("TLS：支持两种模式。快速预检=发送 ClientHello 判断响应头；标准握手=走 rustls 完整握手（关闭证书验证，仅做连通性判断）。");
                             ui.label("安全：综合协议、TLS、证书校验策略、稳定性、GFW通过性/防追踪/现网稳定性画像与本地网络可达性得出的安全等级。");
                             ui.label("加密：根据协议和可见配置推断的加密强度。");
                             ui.label("GFW通过性：根据 TLS/REALITY、SNI、ALPN 与传输伪装评估穿透 GFW 的适配度。");
@@ -1855,8 +2054,8 @@ impl eframe::App for ClashCheckerApp {
 
                             ui.heading("顶部菜单栏");
                             ui.label("文件：开始检测、导出可用节点、打开导出目录、清空结果、清空输入。");
-                            ui.label("检测：快速切换 TLS 预检与稳定性窗口，支持一键重置参数。");
-                            ui.label("视图：切换精简/完整表格模式，并打开选中节点详情。");
+                            ui.label("检测：快速切换 TLS 模式、TLS 开关与稳定性窗口，支持一键重置参数。");
+                            ui.label("视图：切换精简/完整表格模式，打开选中节点详情与历史快照窗口。");
                             ui.label("说明：指标说明、批量导入导出说明、关于。");
                             ui.add_space(8.0);
 
@@ -1917,6 +2116,9 @@ impl eframe::App for ClashCheckerApp {
 
                             ui.heading("导出（可用节点）");
                             ui.label("检测完成后可导出“通过”节点，或勾选“包含部分通过”一起导出。");
+                            ui.label(
+                                "导出支持二次筛选：协议类型 / 最小安全评分 / 最大 TCP 均延迟。",
+                            );
                             ui.label("导出预设：自动识别 / Clash / FlClash / Karing。");
                             ui.label("导出目录：dist/exports/export-时间戳/");
                             ui.add_space(8.0);
@@ -1955,6 +2157,56 @@ impl eframe::App for ClashCheckerApp {
                         RichText::new(format!("Release 源：{}", update::release_repository_slug()))
                             .weak(),
                     );
+                });
+        }
+
+        if self.show_history_window {
+            egui::Window::new("检测历史快照")
+                .open(&mut self.show_history_window)
+                .resizable(true)
+                .default_size([860.0, 540.0])
+                .min_size([620.0, 360.0])
+                .show(ctx, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("历史记录：{} 条", self.history_snapshots.len()));
+                        if ui.button("刷新").clicked() {
+                            self.history_snapshots = history::load_snapshots();
+                        }
+                    });
+                    ui.add_space(8.0);
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.history_snapshots.is_empty() {
+                                ui.label("暂无历史记录。完成一次检测后会自动写入快照。");
+                                return;
+                            }
+
+                            egui::Grid::new("history_snapshot_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([12.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.strong("时间");
+                                    ui.strong("总节点");
+                                    ui.strong("严格通过");
+                                    ui.strong("失败");
+                                    ui.strong("TCP可连");
+                                    ui.strong("平均安全分");
+                                    ui.end_row();
+
+                                    for item in self.history_snapshots.iter().rev() {
+                                        ui.label(item.timestamp_label());
+                                        ui.label(item.total.to_string());
+                                        ui.label(item.strict_pass.to_string());
+                                        ui.label(item.fail.to_string());
+                                        ui.label(item.tcp_alive.to_string());
+                                        ui.label(format!("{}", item.avg_security_score));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
                 });
         }
 
@@ -2243,12 +2495,20 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             }
         };
 
-        let output = Command::new("powershell")
+        let output = Command::new("pwsh")
             .arg("-NoProfile")
             .arg("-STA")
             .arg("-Command")
             .arg(script)
             .output()
+            .or_else(|_| {
+                Command::new("powershell")
+                    .arg("-NoProfile")
+                    .arg("-STA")
+                    .arg("-Command")
+                    .arg(script)
+                    .output()
+            })
             .map_err(|error| error.to_string())?;
 
         if !output.status.success() {
@@ -2296,6 +2556,58 @@ enum RowFilter {
 enum TableMode {
     Compact,
     Full,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportProtocolFilter {
+    All,
+    Trojan,
+    Vless,
+    Vmess,
+    Hysteria2,
+    Tuic,
+    TlsLike,
+}
+
+impl ExportProtocolFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::All => "全部协议",
+            Self::Trojan => "trojan",
+            Self::Vless => "vless",
+            Self::Vmess => "vmess",
+            Self::Hysteria2 => "hysteria2",
+            Self::Tuic => "tuic",
+            Self::TlsLike => "TLS类协议",
+        }
+    }
+
+    fn matches(&self, result: &NodeCheckResult) -> bool {
+        let protocol = result.node.node_type.to_ascii_lowercase();
+        match self {
+            Self::All => true,
+            Self::Trojan => protocol == "trojan",
+            Self::Vless => protocol == "vless",
+            Self::Vmess => protocol == "vmess",
+            Self::Hysteria2 => protocol == "hysteria2",
+            Self::Tuic => protocol == "tuic",
+            Self::TlsLike => {
+                result.tls_status.is_passed()
+                    || result.node.tls == Some(true)
+                    || result
+                        .node
+                        .security
+                        .as_ref()
+                        .map(|value| {
+                            matches!(
+                                value.to_ascii_lowercase().as_str(),
+                                "tls" | "xtls" | "reality"
+                            )
+                        })
+                        .unwrap_or(false)
+            }
+        }
+    }
 }
 
 fn configure_chinese_font(ctx: &egui::Context) {

@@ -33,7 +33,7 @@ function Find-MatchFiles {
             '!dist/**'
         )
 
-        $files = & rg -l --pcre2 @rgCommonArgs $Pattern .
+        $files = & rg -l --pcre2 @rgCommonArgs -e $Pattern .
         if ($LASTEXITCODE -gt 1) {
             throw "sanitize scan failed with ripgrep exit code $LASTEXITCODE."
         }
@@ -80,4 +80,5 @@ if ($hits.Count -gt 0) {
 }
 
 Write-Host 'Sanitize preflight passed. No obvious tokens or private keys were found.' -ForegroundColor Green
+$global:LASTEXITCODE = 0
 

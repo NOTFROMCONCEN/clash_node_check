@@ -28,6 +28,7 @@ pub struct CheckOptions {
     pub attempts: u8,
     pub workers: usize,
     pub enable_tls_probe: bool,
+    pub tls_probe_mode: TlsProbeMode,
     pub stability_window_secs: u16,
 }
 
@@ -38,7 +39,23 @@ impl Default for CheckOptions {
             attempts: 3,
             workers: 24,
             enable_tls_probe: true,
+            tls_probe_mode: TlsProbeMode::FastClientHello,
             stability_window_secs: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsProbeMode {
+    FastClientHello,
+    StandardHandshake,
+}
+
+impl TlsProbeMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FastClientHello => "快速预检",
+            Self::StandardHandshake => "标准握手",
         }
     }
 }
@@ -943,10 +960,22 @@ fn run_tls_probe(
 
     let ordered_addrs = ordered_socket_addrs(socket_addrs, prefer_addr);
 
-    let mut last_error = "TLS 握手失败".to_owned();
+    match options.tls_probe_mode {
+        TlsProbeMode::FastClientHello => {
+            run_tls_probe_fast_client_hello(&ordered_addrs, options.timeout)
+        }
+        TlsProbeMode::StandardHandshake => run_tls_probe_standard(node, &ordered_addrs, options),
+    }
+}
+
+fn run_tls_probe_fast_client_hello(
+    ordered_addrs: &[SocketAddr],
+    timeout: Duration,
+) -> TlsProbeStatusWithLatency {
+    let mut last_error = "TLS 预检失败".to_owned();
 
     for addr in ordered_addrs {
-        let mut tcp_stream = match TcpStream::connect_timeout(&addr, options.timeout) {
+        let mut tcp_stream = match TcpStream::connect_timeout(addr, timeout) {
             Ok(stream) => stream,
             Err(error) => {
                 last_error = format!("TLS TCP 连接失败: {error}");
@@ -954,8 +983,8 @@ fn run_tls_probe(
             }
         };
 
-        let _ = tcp_stream.set_read_timeout(Some(options.timeout));
-        let _ = tcp_stream.set_write_timeout(Some(options.timeout));
+        let _ = tcp_stream.set_read_timeout(Some(timeout));
+        let _ = tcp_stream.set_write_timeout(Some(timeout));
         let started_at = Instant::now();
 
         match tls_client_hello_probe(&mut tcp_stream) {
@@ -966,7 +995,35 @@ fn run_tls_probe(
                 }
             }
             Err(error) => {
-                last_error = error.to_string();
+                last_error = error;
+            }
+        }
+    }
+
+    TlsProbeStatusWithLatency {
+        status: TlsProbeStatus::Failed(last_error),
+        latency_ms: None,
+    }
+}
+
+fn run_tls_probe_standard(
+    node: &ProxyNode,
+    ordered_addrs: &[SocketAddr],
+    options: &CheckOptions,
+) -> TlsProbeStatusWithLatency {
+    let mut last_error = "标准 TLS 握手失败".to_owned();
+
+    for socket_addr in ordered_addrs {
+        let started_at = Instant::now();
+        match tls_connect(node, socket_addr, options.timeout) {
+            Ok(_) => {
+                return TlsProbeStatusWithLatency {
+                    status: TlsProbeStatus::Passed,
+                    latency_ms: Some(started_at.elapsed().as_millis()),
+                }
+            }
+            Err(error) => {
+                last_error = format!("标准 TLS 握手失败: {error}");
             }
         }
     }
