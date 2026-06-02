@@ -47,6 +47,7 @@ pub struct ClashCheckerApp {
     export_protocol_filter: ExportProtocolFilter,
     export_min_score: u8,
     export_max_latency_ms: u16,
+    export_limit: u16,
     status_line: String,
     start_summary: StartSummary,
     results: Vec<NodeCheckResult>,
@@ -83,6 +84,7 @@ impl ClashCheckerApp {
             export_protocol_filter: ExportProtocolFilter::All,
             export_min_score: 0,
             export_max_latency_ms: 0,
+            export_limit: 0,
             status_line: "输入订阅 URL 或本地配置文件/目录后开始检测".to_owned(),
             start_summary: StartSummary::default(),
             results: Vec::new(),
@@ -171,7 +173,7 @@ impl ClashCheckerApp {
     }
 
     fn export_available_nodes(&mut self) {
-        let selected_results: Vec<_> = self
+        let mut selected_results: Vec<_> = self
             .results
             .iter()
             .filter(|result| {
@@ -187,6 +189,22 @@ impl ClashCheckerApp {
                         .is_some_and(|value| value <= self.export_max_latency_ms as u128)
             })
             .collect();
+        selected_results.sort_by(|left, right| {
+            right
+                .security
+                .score
+                .cmp(&left.security.score)
+                .then_with(|| {
+                    left.tcp_avg_latency_ms
+                        .unwrap_or(u128::MAX)
+                        .cmp(&right.tcp_avg_latency_ms.unwrap_or(u128::MAX))
+                })
+                .then_with(|| left.node.name.cmp(&right.node.name))
+        });
+        let matched_count = selected_results.len();
+        if self.export_limit > 0 {
+            selected_results.truncate(self.export_limit as usize);
+        }
 
         let nodes: Vec<_> = selected_results
             .iter()
@@ -208,9 +226,9 @@ impl ClashCheckerApp {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.status_line = format!(
-                    "导出完成：{} 节点（筛选命中 {}）-> {}（{}）",
+                    "导出完成：{} 节点（筛选命中 {}，已按评分/延迟排序）-> {}（{}）",
                     outcome.node_count,
-                    selected_results.len(),
+                    matched_count,
                     outcome.output_dir.display(),
                     file_names
                 );
@@ -519,14 +537,18 @@ impl ClashCheckerApp {
 
                 ui.add_space(6.0);
                 if let Some(last) = self.history_snapshots.last() {
+                    let trend = history_trend_text(&self.history_snapshots);
                     ui.label(format!(
-                        "最近一次：{} | 总节点 {} | 严格通过 {} | 失败 {} | 平均安全分 {}",
+                        "最近一次：{} | 总节点 {} | 严格通过 {:.1}% | 失败 {:.1}% | 平均安全分 {}",
                         last.timestamp_label(),
                         last.total,
-                        last.strict_pass,
-                        last.fail,
+                        last.strict_pass_rate(),
+                        last.fail_rate(),
                         last.avg_security_score
                     ));
+                    if let Some(trend) = trend {
+                        ui.label(RichText::new(trend).small().weak());
+                    }
                 } else {
                     ui.label("暂无历史记录。完成一次检测后会自动生成快照。");
                 }
@@ -1574,10 +1596,17 @@ impl ClashCheckerApp {
                                     .suffix(" ms")
                                     .speed(1),
                             );
+                            ui.label("最佳数量");
+                            ui.add(
+                                egui::DragValue::new(&mut self.export_limit)
+                                    .suffix(" 个")
+                                    .speed(1),
+                            );
                             if ui.button("重置筛选").clicked() {
                                 self.export_protocol_filter = ExportProtocolFilter::All;
                                 self.export_min_score = 0;
                                 self.export_max_latency_ms = 0;
+                                self.export_limit = 0;
                             }
                         });
                         ui.add_space(4.0);
@@ -1591,7 +1620,7 @@ impl ClashCheckerApp {
                             {
                                 self.export_available_nodes();
                             }
-                            ui.small("最大延迟设为 0 表示不限制");
+                            ui.small("最大延迟/最佳数量设为 0 表示不限制");
                         });
 
                         ui.add_space(8.0);
@@ -2184,15 +2213,18 @@ impl eframe::App for ClashCheckerApp {
                             }
 
                             egui::Grid::new("history_snapshot_grid")
-                                .num_columns(6)
+                                .num_columns(9)
                                 .striped(true)
                                 .spacing([12.0, 8.0])
                                 .show(ui, |ui| {
                                     ui.strong("时间");
                                     ui.strong("总节点");
                                     ui.strong("严格通过");
+                                    ui.strong("通过率");
                                     ui.strong("失败");
+                                    ui.strong("失败率");
                                     ui.strong("TCP可连");
+                                    ui.strong("TCP率");
                                     ui.strong("平均安全分");
                                     ui.end_row();
 
@@ -2200,8 +2232,11 @@ impl eframe::App for ClashCheckerApp {
                                         ui.label(item.timestamp_label());
                                         ui.label(item.total.to_string());
                                         ui.label(item.strict_pass.to_string());
+                                        ui.label(format!("{:.1}%", item.strict_pass_rate()));
                                         ui.label(item.fail.to_string());
+                                        ui.label(format!("{:.1}%", item.fail_rate()));
                                         ui.label(item.tcp_alive.to_string());
+                                        ui.label(format!("{:.1}%", item.tcp_alive_rate()));
                                         ui.label(format!("{}", item.avg_security_score));
                                         ui.end_row();
                                     }
@@ -2920,6 +2955,20 @@ fn short_text(input: &str, max_chars: usize) -> String {
     output
 }
 
+fn history_trend_text(snapshots: &[HistorySnapshot]) -> Option<String> {
+    let [.., previous, latest] = snapshots else {
+        return None;
+    };
+
+    let pass_delta = latest.strict_pass_rate() - previous.strict_pass_rate();
+    let fail_delta = latest.fail_rate() - previous.fail_rate();
+    let score_delta = latest.avg_security_score as i16 - previous.avg_security_score as i16;
+    Some(format!(
+        "较上次：严格通过 {:+.1}% | 失败 {:+.1}% | 平均安全分 {:+}",
+        pass_delta, fail_delta, score_delta
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2985,6 +3034,34 @@ mod tests {
             },
             message: "ok".to_owned(),
         }
+    }
+
+    fn sample_history_snapshot(strict_pass: usize, fail: usize, score: u8) -> HistorySnapshot {
+        HistorySnapshot {
+            unix_ts: 0,
+            total: 10,
+            tcp_alive: 9,
+            strict_pass,
+            warn: 10 - strict_pass - fail,
+            fail,
+            tls_pass: strict_pass,
+            udp_pass: 0,
+            ttfb_pass: strict_pass,
+            avg_security_score: score,
+        }
+    }
+
+    #[test]
+    fn describes_history_trend_between_last_two_snapshots() {
+        let trend = history_trend_text(&[
+            sample_history_snapshot(4, 3, 70),
+            sample_history_snapshot(6, 1, 78),
+        ])
+        .unwrap();
+
+        assert!(trend.contains("严格通过 +20.0%"));
+        assert!(trend.contains("失败 -20.0%"));
+        assert!(trend.contains("平均安全分 +8"));
     }
 
     #[test]

@@ -10,6 +10,10 @@ use crate::subscription::{
     SubscriptionContentKind,
 };
 
+const MAX_SCAN_DEPTH: usize = 8;
+const MAX_SCANNED_FILES: usize = 5_000;
+const MAX_CANDIDATE_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExportPreset {
     Auto,
@@ -66,6 +70,8 @@ impl ClientKind {
 struct ScanStats {
     scanned_files: usize,
     matched_files: usize,
+    skipped_large_files: usize,
+    skipped_limit_hits: usize,
     client_hits: BTreeMap<String, usize>,
 }
 
@@ -149,9 +155,11 @@ fn load_nodes_from_local_path(path: &Path) -> Result<ImportedNodes, String> {
             ));
         }
         stats.scanned_files = 1;
-        candidates.push(path.to_path_buf());
+        if is_candidate_file_size_ok(path, &mut stats) {
+            candidates.push(path.to_path_buf());
+        }
     } else {
-        collect_candidate_files(path, &mut candidates, &mut stats.scanned_files)?;
+        collect_candidate_files(path, 0, &mut candidates, &mut stats)?;
     }
 
     if candidates.is_empty() {
@@ -178,9 +186,11 @@ fn load_nodes_from_local_path(path: &Path) -> Result<ImportedNodes, String> {
     }
 
     let source_note = format!(
-        "来源：本地批量导入（扫描 {} 文件，识别 {}，客户端：{}）",
+        "来源：本地批量导入（扫描 {} 文件，识别 {}，跳过大文件 {}，扫描上限命中 {}，客户端：{}）",
         stats.scanned_files,
         stats.matched_files,
+        stats.skipped_large_files,
+        stats.skipped_limit_hits,
         stats.summary()
     );
 
@@ -193,12 +203,27 @@ fn load_nodes_from_local_path(path: &Path) -> Result<ImportedNodes, String> {
 
 fn collect_candidate_files(
     root: &Path,
+    depth: usize,
     output: &mut Vec<PathBuf>,
-    scanned_files: &mut usize,
+    stats: &mut ScanStats,
 ) -> Result<(), String> {
+    if depth > MAX_SCAN_DEPTH {
+        stats.skipped_limit_hits += 1;
+        return Ok(());
+    }
+    if stats.scanned_files >= MAX_SCANNED_FILES {
+        stats.skipped_limit_hits += 1;
+        return Ok(());
+    }
+
     let entries =
         fs::read_dir(root).map_err(|error| format!("读取目录失败 {}: {error}", root.display()))?;
     for entry in entries {
+        if stats.scanned_files >= MAX_SCANNED_FILES {
+            stats.skipped_limit_hits += 1;
+            break;
+        }
+
         let entry = entry.map_err(|error| format!("遍历目录失败 {}: {error}", root.display()))?;
         let path = entry.path();
         if path.is_dir() {
@@ -210,15 +235,28 @@ fn collect_candidate_files(
             if matches!(name.as_str(), ".git" | "target" | "dist" | "node_modules") {
                 continue;
             }
-            collect_candidate_files(&path, output, scanned_files)?;
+            collect_candidate_files(&path, depth + 1, output, stats)?;
         } else if path.is_file() {
-            *scanned_files += 1;
-            if should_scan_file(&path) {
+            stats.scanned_files += 1;
+            if should_scan_file(&path) && is_candidate_file_size_ok(&path, stats) {
                 output.push(path);
             }
         }
     }
     Ok(())
+}
+
+fn is_candidate_file_size_ok(path: &Path, stats: &mut ScanStats) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+
+    if metadata.len() > MAX_CANDIDATE_FILE_BYTES {
+        stats.skipped_large_files += 1;
+        return false;
+    }
+
+    true
 }
 
 fn should_scan_file(path: &Path) -> bool {
@@ -706,6 +744,31 @@ mod tests {
             .any(|path| path.ends_with("karing-import.txt")));
 
         std::env::set_current_dir(old_cwd).unwrap();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn skips_oversized_candidate_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "clash-node-checker-scan-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let large_path = tmp.join("large.yaml");
+        let file = fs::File::create(&large_path).unwrap();
+        file.set_len(MAX_CANDIDATE_FILE_BYTES + 1).unwrap();
+
+        let mut stats = ScanStats::default();
+        let mut candidates = Vec::new();
+        collect_candidate_files(&tmp, 0, &mut candidates, &mut stats).unwrap();
+
+        assert!(candidates.is_empty());
+        assert_eq!(stats.scanned_files, 1);
+        assert_eq!(stats.skipped_large_files, 1);
+
         let _ = fs::remove_dir_all(&tmp);
     }
 }

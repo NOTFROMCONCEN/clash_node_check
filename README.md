@@ -82,6 +82,7 @@
 - 输入框支持：
   - 在线订阅 URL（`http/https`）
   - 本地文件/目录路径（自动扫描 `yml/yaml/json/txt/conf/list`）
+- 本地目录导入带保护上限：默认最多扫描 5000 个文件、递归 8 层，并跳过超过 8MB 的候选配置文件
 - 支持自动识别主流客户端来源：`Karing / FlClash / Clash`
 - 检测后可导出可用节点（支持“包含部分通过”），导出预设：
   - 自动识别
@@ -89,7 +90,8 @@
   - FlClash
   - Karing
 - 导出目录：`dist/exports/export-时间戳/`
-- 导出筛选：协议类型、最小安全评分、最大 TCP 均延迟（`0` 表示不限制）
+- 导出筛选：协议类型、最小安全评分、最大 TCP 均延迟、最佳节点数量（`0` 表示不限制）
+- 导出顺序：按安全评分从高到低、TCP 均延迟从低到高排序，便于直接生成精简配置
 - 当前限制：`zip` 需先手动解压后再导入目录
 
 ## 顶部菜单栏
@@ -117,7 +119,7 @@ cargo test
 - 启动后会自动检查一次 GitHub Release 最新版本，也可以在界面中手动点击“检查更新”。
 - 更新检测默认通过 `https://github.com/<owner>/<repo>/releases/latest` 跳转地址解析版本号，不依赖 GitHub REST API 限额。
 - 更新检测内置 6 小时本地缓存（`dist/cache/release-check-cache.json`），减少重复请求。
-- 检测历史快照默认保存在 `dist/history/snapshots.json`，每次检测完成自动追加并保留最近 40 条。
+- 检测历史快照默认保存在 `dist/history/snapshots.json`，每次检测完成自动追加并保留最近 40 条；历史窗口会显示通过率、失败率和相对上次的趋势。
 - 若 latest 跳转异常，会自动回退到 `releases.atom` 解析最新版本。
 - 更新检测只负责发现新版本和跳转下载，不会在本地自动覆盖可执行文件。
 - 默认 Release 源：`NOTFROMCONCEN/clash_node_check`
